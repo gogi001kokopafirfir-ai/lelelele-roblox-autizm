@@ -1,148 +1,179 @@
--- morph-deep-diagnostic.lua
--- Поставь в инжектор и запуusti. Скопируй весь Output сюда.
-
-local VISUAL_NAMES = {"LOCAL_VISUAL_DEER","LocalVisual_Deer","LOCAL_VISUAL","Deer"} -- варианты
+-- morph-fix-anim-patch.lua
+-- Патч: разрешает работу анимаций и снижает дерганье.
+local VISUAL_NAMES = {"LOCAL_VISUAL_DEER","LocalVisual_Deer","LocalVisual_Deer","Deer"}
 local IDLE_ID = "rbxassetid://138304500572165"
 local WALK_ID = "rbxassetid://78826693826761"
 
-local function findVisual()
-    for _,n in ipairs(VISUAL_NAMES) do
-        local m = workspace:FindFirstChild(n)
-        if m and m:IsA("Model") then return m end
-    end
-    for _,m in ipairs(workspace:GetChildren()) do
-        if m:IsA("Model") and string.find(string.lower(m.Name or ""), "deer") then return m end
-    end
-    return nil
+local RS = game:GetService("RunService")
+local visual
+for _,n in ipairs(VISUAL_NAMES) do
+    local m = workspace:FindFirstChild(n)
+    if m and m:IsA("Model") then visual = m; break end
 end
-
-local visual = findVisual()
 if not visual then
-    warn("[diag] Visual model not found. Название в VISUAL_NAMES неверно или визуал не в workspace.")
+    warn("[patch] visual model not found. Убедись, что визуал в workspace и назван как в VISUAL_NAMES.")
     return
 end
 
-print("[diag] Visual found:", visual:GetFullName())
+print("[patch] applying animation fix to", visual:GetFullName())
 
--- Motor6D list
+-- 1) Найдём Motor6D и части которые они контролируют
+local motorParts = {}
 local motors = {}
-for _,v in ipairs(visual:GetDescendants()) do
-    if v:IsA("Motor6D") then table.insert(motors, v) end
+for _,desc in ipairs(visual:GetDescendants()) do
+    if desc:IsA("Motor6D") then
+        table.insert(motors, desc)
+        if desc.Part0 and desc.Part0:IsA("BasePart") then motorParts[desc.Part0] = true end
+        if desc.Part1 and desc.Part1:IsA("BasePart") then motorParts[desc.Part1] = true end
+    end
 end
-print("[diag] Motor6D count:", #motors)
-for i,m in ipairs(motors) do
-    print(string.format("  %d) %s  Part0=%s  Part1=%s", i, m.Name, (m.Part0 and m.Part0.Name or "nil"), (m.Part1 and m.Part1.Name or "nil")))
-end
+print("[patch] found Motor6D count:", #motors)
 
--- Detect rig by part names
-local function detectRig()
-    local names = {}
-    for _,p in ipairs(visual:GetDescendants()) do if p:IsA("BasePart") then names[p.Name] = true end end
-    if names["UpperTorso"] or names["LowerTorso"] or names["RightUpperArm"] then return "R15" end
-    if names["Torso"] or names["Right Arm"] or names["Left Leg"] then return "R6" end
-    return "unknown"
-end
-local rig = detectRig()
-print("[diag] Detected rig:", rig)
-
--- Ensure parts that Motors control are not anchored (so animation can move them)
-local changed = 0
-for _,m in ipairs(motors) do
-    for _,p in ipairs({m.Part0, m.Part1}) do
-        if p and p:IsA("BasePart") and p.Anchored then
-            pcall(function() p.Anchored = false end)
-            changed = changed + 1
+-- 2) Снимаем Anchored у моторных частей, ставим Anchored=true у остальных (чтобы минимизировать физику)
+local touched = 0; local anchoredSet = 0
+for _,part in ipairs(visual:GetDescendants()) do
+    if part:IsA("BasePart") then
+        if motorParts[part] then
+            if part.Anchored then
+                pcall(function() part.Anchored = false end)
+                touched = touched + 1
+            end
+            pcall(function() part.CanCollide = false end)
+        else
+            -- для остальных частей можно оставить Anchored true, чтобы уменьшить физ. конфликты
+            if not part.Anchored then
+                pcall(function() part.Anchored = true end)
+                anchoredSet = anchoredSet + 1
+            end
+            pcall(function() part.CanCollide = false end)
         end
     end
 end
-print("[diag] Un-anchored motorized parts count:", changed)
+print(string.format("[patch] motor parts un-anchored: %d, non-motor anchored: %d", touched, anchoredSet))
 
--- Ensure we have a Humanoid + Animator
-local humanoid = visual:FindFirstChildOfClass("Humanoid")
-if not humanoid then
-    humanoid = Instance.new("Humanoid")
-    humanoid.Name = "DiagHumanoid"
-    humanoid.Parent = visual
-    print("[diag] Created Humanoid in visual")
-else
-    print("[diag] Visual already has Humanoid")
-end
-
-local animator = humanoid:FindFirstChildOfClass("Animator")
-if not animator then
+-- 3) Перезапустим/создадим Humanoid + Animator у визуала и загрузим треки заново
+local function ensureAnimatorOnVisual()
+    local hum = visual:FindFirstChildOfClass("Humanoid")
+    if not hum then
+        hum = Instance.new("Humanoid")
+        hum.Name = "VisualHumanoid"
+        hum.Parent = visual
+        print("[patch] created Visual Humanoid")
+    end
+    -- remove any stray AnimationController to avoid conflict
+    local ac = visual:FindFirstChildOfClass("AnimationController")
+    if ac then
+        pcall(function() ac:Destroy() end)
+    end
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if animator then
+        pcall(function() animator:Destroy() end)
+    end
     animator = Instance.new("Animator")
-    animator.Parent = humanoid
-    print("[diag] Created Animator under Humanoid")
-else
-    print("[diag] Animator exists under Humanoid")
+    animator.Parent = hum
+    return hum, animator
 end
 
--- Also try AnimationController route (some custom rigs expect it)
-local controller = visual:FindFirstChildOfClass("AnimationController")
-local ctrlAnimator = nil
-if not controller then
-    controller = Instance.new("AnimationController")
-    controller.Name = "DiagAnimController"
-    controller.Parent = visual
-    ctrlAnimator = Instance.new("Animator"); ctrlAnimator.Parent = controller
-    print("[diag] Created AnimationController + Animator")
-else
-    ctrlAnimator = controller:FindFirstChildOfClass("Animator") or (function() local a=Instance.new("Animator"); a.Parent=controller; return a end)()
-    print("[diag] AnimationController exists")
-end
+local hum, animator = ensureAnimatorOnVisual()
 
-local function tryLoadAndPlay(anId, who, animatorToUse)
-    if not animatorToUse then print("[diag] no animator for", who); return nil end
-    local a = Instance.new("Animation")
-    a.AnimationId = anId
-    a.Parent = visual
-    print("[diag] Loading animation", anId, "via", who)
-    local ok, track = pcall(function() return animatorToUse:LoadAnimation(a) end)
-    if not ok then
-        print("[diag] LoadAnimation pcall error for", who, track)
+-- helper load track
+local function loadTrack(animatorObj, animId)
+    if not animatorObj or not animId then return nil end
+    local anim = Instance.new("Animation")
+    anim.AnimationId = animId
+    anim.Parent = visual
+    local ok, track = pcall(function() return animatorObj:LoadAnimation(anim) end)
+    if not ok or not track then
+        warn("[patch] LoadAnimation failed for", animId, track)
+        pcall(function() anim:Destroy() end)
         return nil
     end
-    if not track then
-        print("[diag] animator:LoadAnimation returned nil for", who)
-        return nil
-    end
-    print("[diag] -> Loaded track (name):", track.Name)
-    -- attempt to play
-    local ok2, err2 = pcall(function() track:Play() end)
-    if not ok2 then print("[diag] track:Play failed:", err2); return nil end
-    print("[diag] -> track.IsPlaying after Play:", track.IsPlaying)
+    track.Priority = Enum.AnimationPriority.Movement
     return track
 end
 
--- try play via Humanoid.Animator
-local trackA = tryLoadAndPlay(IDLE_ID, "Humanoid.Animator", animator)
-task.wait(0.6)
-local trackB = tryLoadAndPlay(WALK_ID, "Humanoid.Animator", animator)
-task.wait(0.6)
-
--- try play via AnimationController.Animator
-local trackC = tryLoadAndPlay(IDLE_ID, "AnimationController.Animator", ctrlAnimator)
-task.wait(0.6)
-local trackD = tryLoadAndPlay(WALK_ID, "AnimationController.Animator", ctrlAnimator)
-task.wait(0.6)
-
-print("[diag] Status: Humanoid-tracks:", (trackA and trackA.IsPlaying) and "idle-playing" or tostring(trackA), (trackB and trackB.IsPlaying) and "walk-playing" or tostring(trackB))
-print("[diag] Status: Controller-tracks:", (trackC and trackC.IsPlaying) and "idle-playing" or tostring(trackC), (trackD and trackD.IsPlaying) and "walk-playing" or tostring(trackD))
-
--- manual Motor6D test: rotate first motor small amount back/forth
-if #motors > 0 then
-    local m = motors[1]
-    local orig = m.C0
-    print("[diag] Manual motor test on:", m.Name, "Part1:", (m.Part1 and m.Part1.Name or "nil"))
-    for i=1,6 do
-        local ang = (i%2==0) and 0.25 or -0.25
-        pcall(function() m.C0 = orig * CFrame.Angles(ang,0,0) end)
-        task.wait(0.18)
+-- stop existing tracks if any
+pcall(function()
+    for _,t in ipairs(hum:GetDescendants()) do
+        if t:IsA("AnimationTrack") then
+            pcall(function() t:Stop() end)
+        end
     end
-    pcall(function() m.C0 = orig end)
-    print("[diag] Manual motor test done")
-else
-    print("[diag] No Motor6D found - model cannot be animated by standard humanoid animations")
+end)
+
+local idleTrack = loadTrack(animator, IDLE_ID)
+local walkTrack = loadTrack(animator, WALK_ID)
+if idleTrack then pcall(function() idleTrack.Looped = true; idleTrack:Play() end) end
+print("[patch] idleTrack loaded:", tostring(idleTrack), "walkTrack:", tostring(walkTrack))
+
+-- 4) Плавное перемещение: будем использовать PivotTo вместо SetPrimaryPartCFrame и экспоненциальное сглаживание
+--    для вертикальной позиции используем lastGroundY, обновляем реже чтобы не дергало
+local hrp = (game.Players.LocalPlayer.Character and (game.Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart") or game.Players.LocalPlayer.Character.PrimaryPart))
+if not hrp then hrp = game.Players.LocalPlayer.CharacterAdded:Wait():WaitForChild("HumanoidRootPart", 3) end
+if not hrp then warn("[patch] HRP not found for LocalPlayer"); end
+
+local lastGroundY = hrp and hrp.Position.Y or 0
+local baseOffset = visual.PrimaryPart and (visual.PrimaryPart.Position.Y - (function() local minY=math.huge; for _,p in ipairs(visual:GetDescendants()) do if p:IsA("BasePart") then minY = math.min(minY, p.Position.Y - p.Size.Y/2) end end; if minY==math.huge then return 0 else return minY end end)()) or 0
+local smoothGroundY = lastGroundY + baseOffset
+
+local function expAlpha(speed, dt)
+    if dt <= 0 then return 1 end
+    return 1 - math.exp(-speed * dt)
 end
 
-print("[diag] DIAGNOSTIC FINISHED - paste all output here.")
+local FOLLOW_SPEED = 14
+local VERT_SPEED = 6
+local PREFERRED_DT = 1/60
+
+local lastTime = tick()
+local conn
+conn = RS.Heartbeat:Connect(function(dt)
+    local ok, err = pcall(function()
+        if not visual or not visual.PrimaryPart or not hrp then return end
+        -- update ground Y less frequently
+        lastGroundY = (function()
+            local rayParams = RaycastParams.new()
+            rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+            rayParams.FilterDescendantsInstances = {game.Players.LocalPlayer.Character}
+            local res = workspace:Raycast(hrp.Position + Vector3.new(0,0.5,0), Vector3.new(0,-400,0), rayParams)
+            if res and res.Position then return res.Position.Y else return hrp.Position.Y - 2 end
+        end)()
+        local targetPrimaryY = lastGroundY + baseOffset
+        local a_v = expAlpha(VERT_SPEED, dt)
+        smoothGroundY = smoothGroundY + (targetPrimaryY - smoothGroundY) * a_v
+
+        -- yaw
+        local _, yaw, _ = hrp.CFrame:ToOrientation()
+        if type(yaw) ~= "number" then yaw = 0 end
+
+        local targetPos = Vector3.new(hrp.Position.X, smoothGroundY, hrp.Position.Z)
+        local targetC = CFrame.new(targetPos) * CFrame.Angles(0, yaw, 0)
+
+        -- smooth interp towards target using exp alpha
+        local a = expAlpha(FOLLOW_SPEED, dt)
+        local newC = visual.PrimaryPart.CFrame:Lerp(targetC, a)
+        -- use PivotTo for smoother movement
+        pcall(function() visual:PivotTo(newC) end)
+    end)
+    if not ok then
+        warn("[patch] follow pcall failed:", err)
+    end
+end)
+
+-- 5) ensure animations will switch on player Running
+local realHum = game.Players.LocalPlayer.Character and game.Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+if realHum and walkTrack then
+    realHum.Running:Connect(function(speed)
+        if speed and speed > 0.5 then
+            pcall(function() if idleTrack and idleTrack.IsPlaying then idleTrack:Stop(0.12) end end)
+            pcall(function() if walkTrack and not walkTrack.IsPlaying then walkTrack:Play() end end)
+        else
+            pcall(function() if walkTrack and walkTrack.IsPlaying then walkTrack:Stop(0.12) end end)
+            pcall(function() if idleTrack and not idleTrack.IsPlaying then idleTrack:Play() end end)
+        end
+    end)
+end
+
+print("[patch] patch applied. If animation не начались — перезапусти визуал и/или пришли вывод следующих строк:")
+print(" - idleTrack:", tostring(idleTrack), " walkTrack:", tostring(walkTrack))
+print(" - попробуй встать и походить, скопируй в Output любые 'LoadAnimation failed' или предупреждения.")
