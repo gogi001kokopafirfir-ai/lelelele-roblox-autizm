@@ -1,15 +1,15 @@
--- visual-morph-fixed-v4.lua (client-side)
--- Стабильный режим: все части визуала Anchored=true + экспоненциальное сглаживание.
+-- visual-morph-fixed-v5.lua (client)
+-- Исправления: правильное сравнение ориентации (yaw), стабильный follow + защита.
 
 local MODEL_NAME = "Deer"
 local VISUAL_NAME = "LOCAL_VISUAL_DEER"
 local IDLE_ID = "rbxassetid://138304500572165"
 local WALK_ID = "rbxassetid://78826693826761"
 
-local FOLLOW_SMOOTH_SPEED = 18       -- больше = быстрее следование (экспоненциальный фактор)
-local VERTICAL_SMOOTH_SPEED = 8      -- скорость сглаживания вертикали (groundY)
-local GROUND_RAY_INTERVAL = 0.12     -- как часто пересчитывать рейкаст groundY (в сек)
-local POSITION_DEADZONE = 0.02       -- если ближе чем это, не дергаем
+local FOLLOW_SMOOTH_SPEED = 18
+local VERTICAL_SMOOTH_SPEED = 8
+local GROUND_RAY_INTERVAL = 0.12
+local POSITION_DEADZONE = 0.02
 local FP_HEAD_FACTOR = 0.7
 
 local Players = game:GetService("Players")
@@ -20,7 +20,6 @@ local lp = Players.LocalPlayer
 if not lp then warn("No LocalPlayer"); return end
 local cam = Workspace.CurrentCamera
 
--- === Вспомогательные функции ===
 local function findTemplate()
     local t = Workspace:FindFirstChild(MODEL_NAME)
     if t and t:IsA("Model") then return t end
@@ -72,7 +71,6 @@ local function findGroundY(pos)
     end
 end
 
--- экспоненциальная функция для сглаживания (alpha в [0,1])
 local function expAlpha(speed, dt)
     if dt <= 0 then return 1 end
     local a = 1 - math.exp(-speed * dt)
@@ -81,11 +79,9 @@ local function expAlpha(speed, dt)
     return a
 end
 
--- === Создание визуала ===
+-- create visual
 local template = findTemplate()
 if not template then warn("Template not found: "..tostring(MODEL_NAME)); return end
-
--- удаляем старый
 local prev = Workspace:FindFirstChild(VISUAL_NAME)
 if prev then pcall(function() prev:Destroy() end) end
 
@@ -93,41 +89,39 @@ local ok, visual = pcall(function() return template:Clone() end)
 if not ok or not visual then warn("Clone failed:", visual); return end
 visual.Name = VISUAL_NAME
 
--- sanitize: удаляем серверные скрипты/humanoids, выставим Anchored = true для всех частей (кинетический визуал)
+-- sanitize and anchor visual parts so physics won't fight us
 for _,d in ipairs(visual:GetDescendants()) do
     if d:IsA("Script") or d:IsA("ModuleScript") then pcall(function() d:Destroy() end) end
     if d:IsA("Humanoid") then pcall(function() d:Destroy() end) end
     if d:IsA("BasePart") then
         pcall(function()
-            d.Anchored = true      -- anchor visual parts to avoid physics jitter
+            d.Anchored = true
             d.CanCollide = false
         end)
     end
 end
 
--- primary part
 local prim = visual:FindFirstChild("HumanoidRootPart", true) or visual.PrimaryPart or visual:FindFirstChildWhichIsA("BasePart", true)
 if prim then visual.PrimaryPart = prim end
 visual.Parent = Workspace
 
--- рассчитываем позиционирование
+-- compute placement
 local visualMin = getMinY(visual) or (visual.PrimaryPart and visual.PrimaryPart.Position.Y - 1) or 0
 local playerChar = lp.Character or lp.CharacterAdded:Wait()
 local hrp = playerChar:FindFirstChild("HumanoidRootPart") or playerChar.PrimaryPart
 if not hrp then warn("No HRP on player"); return end
-
 local groundY = findGroundY(hrp.Position)
 local baseOffset = (visual.PrimaryPart and (visual.PrimaryPart.Position.Y - visualMin)) or 1
 local targetPrimaryY = groundY + baseOffset
 
--- начальные состояния сглаживания
 local smoothPrimaryCFrame = visual.PrimaryPart.CFrame
 local smoothGroundY = targetPrimaryY
 local timeSinceLastGround = 0
 
-print(string.format("[morph] initial groundY=%.3f visualMin=%.3f baseOffset=%.3f targetPrimaryY=%.3f", groundY, visualMin, baseOffset, targetPrimaryY))
+print(string.format("[morph] initial groundY=%.3f visualMin=%.3f baseOffset=%.3f targetPrimaryY=%.3f",
+    groundY, visualMin, baseOffset, targetPrimaryY))
 
--- Animator
+-- animator
 local visualHum = Instance.new("Humanoid"); visualHum.Name = "VisualHumanoid"; visualHum.Parent = visual
 local animator = Instance.new("Animator"); animator.Parent = visualHum
 
@@ -144,7 +138,7 @@ local idleTrack = loadTrack(animator, IDLE_ID)
 local walkTrack = loadTrack(animator, WALK_ID)
 if idleTrack then pcall(function() idleTrack.Looped = true; idleTrack:Play() end) end
 
--- tools: visual handles map
+-- tools visuals (per-equip relative transform)
 local toolVisuals = {}
 local function findHand(model)
     local names = {"RightHand","Right Arm","RightUpperArm","RightLowerArm","RightGripAttachment"}
@@ -169,7 +163,6 @@ local function onToolEquipped(tool)
     vh.Parent = visual
     vh.Anchored = true
     vh.CanCollide = false
-    -- hide real handle locally
     pcall(function() handle.LocalTransparencyModifier = 1 end)
     toolVisuals[tool] = {instance = vh, visualHand = visualHand, rel = rel, realHandle = handle}
 end
@@ -203,43 +196,45 @@ bindTools(lp:FindFirstChildOfClass("Backpack"))
 if lp.Character then bindTools(lp.Character) end
 lp.CharacterAdded:Connect(function(ch) bindTools(ch) end)
 
--- follow loop (Heartbeat для dt)
-local lastTick = tick()
+-- follow loop
+local char = lp.Character or lp.CharacterAdded:Wait()
+local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+if not hrp then warn("No HRP"); return end
+
 local followConn
 followConn = RunService.Heartbeat:Connect(function(dt)
     local ok, err = pcall(function()
         if not visual or not visual.PrimaryPart or not hrp then return end
 
-        -- обновляем groundY реже
         timeSinceLastGround = timeSinceLastGround + dt
         if timeSinceLastGround >= GROUND_RAY_INTERVAL then
             local newGround = findGroundY(hrp.Position)
             local newTargetY = newGround + baseOffset
-            -- плавно обновляем smoothGroundY
             local a_vert = expAlpha(VERTICAL_SMOOTH_SPEED, dt)
             smoothGroundY = smoothGroundY + (newTargetY - smoothGroundY) * a_vert
             timeSinceLastGround = 0
         end
 
-        -- yaw безопасно
-        local rx, yaw, rz = hrp.CFrame:ToOrientation()
-        if type(yaw) ~= "number" then yaw = 0 end
+        local rx1, yawCur, rz1 = visual.PrimaryPart.CFrame:ToOrientation()
+        local rx2, yawT, rz2 = hrp.CFrame:ToOrientation()
+        if type(yawCur) ~= "number" then yawCur = 0 end
+        if type(yawT) ~= "number" then yawT = 0 end
 
-        -- целевой CFrame (позиция = hrp.XZ + smoothGroundY Y, ориентация = yaw)
         local targetPos = Vector3.new(hrp.Position.X, smoothGroundY, hrp.Position.Z)
-        local targetCFrame = CFrame.new(targetPos) * CFrame.Angles(0, yaw, 0)
+        local targetCFrame = CFrame.new(targetPos) * CFrame.Angles(0, yawT, 0)
 
-        -- если разница очень мала — не дергаем
-        local cur = visual.PrimaryPart.CFrame
-        if (cur.Position - targetCFrame.Position).Magnitude < POSITION_DEADZONE and math.abs((cur - targetCFrame):ToOrientation()) < 0.001 then
-            -- ничего
+        -- position check + yaw difference check (both scalar numbers)
+        local posDiff = (visual.PrimaryPart.Position - targetCFrame.Position).Magnitude
+        local yawDiff = math.abs(yawCur - yawT)
+        if posDiff < POSITION_DEADZONE and yawDiff < 0.01 then
+            -- very close -> skip
         else
             local a = expAlpha(FOLLOW_SMOOTH_SPEED, dt)
-            local new = cur:Lerp(targetCFrame, a)
+            local new = visual.PrimaryPart.CFrame:Lerp(targetCFrame, a)
             visual:SetPrimaryPartCFrame(new)
         end
 
-        -- обновить visual tool handles
+        -- update tool visuals
         for tool,data in pairs(toolVisuals) do
             if data.instance and data.visualHand and data.rel then
                 pcall(function()
@@ -252,14 +247,14 @@ followConn = RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- FP/TP visibility handling (меняем только при смене состояния)
+        -- FP / TP visibility
         if isFirstPerson() then
             for _,p in ipairs(visual:GetDescendants()) do if p:IsA("BasePart") then p.LocalTransparencyModifier = 1 end end
-            setLocalVisibility(lp.Character, true)
+            setLocalVisibility(char, true)
             for tool,data in pairs(toolVisuals) do if data.realHandle then data.realHandle.LocalTransparencyModifier = 0 end end
         else
             for _,p in ipairs(visual:GetDescendants()) do if p:IsA("BasePart") then p.LocalTransparencyModifier = 0 end end
-            setLocalVisibility(lp.Character, false)
+            setLocalVisibility(char, false)
             for tool,data in pairs(toolVisuals) do if data.realHandle then data.realHandle.LocalTransparencyModifier = 1 end end
         end
     end)
@@ -268,9 +263,9 @@ followConn = RunService.Heartbeat:Connect(function(dt)
     end
 end)
 
--- switch animations by real humanoid running
+-- animation switching
 local realHum = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
-if realHum and walkTrack then
+if realHum then
     realHum.Running:Connect(function(speed)
         if speed and speed > 0.5 then
             if idleTrack and idleTrack.IsPlaying then pcall(function() idleTrack:Stop(0.12) end) end
@@ -287,19 +282,13 @@ lp.Chatted:Connect(function(msg)
     if not visual then return end
     local head = visual:FindFirstChild("Head", true) or visual.PrimaryPart
     if not head then return end
-    local bill = Instance.new("BillboardGui")
-    bill.Adornee = head
-    bill.Size = UDim2.new(0,250,0,60)
-    bill.AlwaysOnTop = true
-    bill.StudsOffset = Vector3.new(0, (head.Size and head.Size.Y or 2) + 0.5, 0)
-    bill.Parent = visual
-    local lbl = Instance.new("TextLabel", bill)
-    lbl.Size = UDim2.new(1,0,1,0); lbl.TextScaled = true; lbl.BackgroundTransparency = 1
+    local bill = Instance.new("BillboardGui"); bill.Adornee = head; bill.Size = UDim2.new(0,250,0,60); bill.AlwaysOnTop = true
+    bill.StudsOffset = Vector3.new(0, (head.Size and head.Size.Y or 2) + 0.5, 0); bill.Parent = visual
+    local lbl = Instance.new("TextLabel", bill); lbl.Size = UDim2.new(1,0,1,0); lbl.TextScaled = true; lbl.BackgroundTransparency = 1
     lbl.Text = msg; lbl.Font = Enum.Font.SourceSansBold; lbl.TextColor3 = Color3.new(1,1,1)
     delay(3, function() pcall(function() bill:Destroy() end) end)
 end)
 
--- revert
 _G.revertMorph = function()
     if followConn then followConn:Disconnect(); followConn = nil end
     for tool,data in pairs(toolVisuals) do
@@ -312,5 +301,4 @@ _G.revertMorph = function()
     print("[morph] reverted")
 end
 
-print("[morph] running. If shaky, run revertMorph() and paste the initial log above here.")
-
+print("[morph] started. Check Output for any 'LoadAnimation failed' lines.")
