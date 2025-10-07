@@ -1,155 +1,148 @@
--- morph-diagnostic-play.lua
--- Диагностика: проверяет Motor6D, снимает Anchored с моторизированных частей и пытается проиграть анимацию.
--- Вставь в инжектор и запусти. Скопируй вывод из Output сюда.
+-- morph-deep-diagnostic.lua
+-- Поставь в инжектор и запуusti. Скопируй весь Output сюда.
 
-local VISUAL_NAMES = {"LOCAL_VISUAL_DEER", "LocalVisual_Deer", "Deer", "LOCAL_VISUAL"} -- варианты
-local IDLE_ID = "rbxassetid://138304500572165" -- твой idle
-local WALK_ID = "rbxassetid://78826693826761" -- твой walk
+local VISUAL_NAMES = {"LOCAL_VISUAL_DEER","LocalVisual_Deer","LOCAL_VISUAL","Deer"} -- варианты
+local IDLE_ID = "rbxassetid://138304500572165"
+local WALK_ID = "rbxassetid://78826693826761"
 
 local function findVisual()
     for _,n in ipairs(VISUAL_NAMES) do
         local m = workspace:FindFirstChild(n)
         if m and m:IsA("Model") then return m end
     end
-    -- fallback: найти модель, у которой в имени 'deer'
     for _,m in ipairs(workspace:GetChildren()) do
-        if m:IsA("Model") and string.find(string.lower(m.Name), "deer") then return m end
+        if m:IsA("Model") and string.find(string.lower(m.Name or ""), "deer") then return m end
     end
     return nil
 end
 
 local visual = findVisual()
 if not visual then
-    warn("[diag] visual model not found. Add name to VISUAL_NAMES or ensure visual exists in workspace.")
+    warn("[diag] Visual model not found. Название в VISUAL_NAMES неверно или визуал не в workspace.")
     return
 end
 
-print("[diag] visual found:", visual:GetFullName())
+print("[diag] Visual found:", visual:GetFullName())
 
--- 1) Собираем Motor6D
+-- Motor6D list
 local motors = {}
 for _,v in ipairs(visual:GetDescendants()) do
-    if v:IsA("Motor6D") then
-        table.insert(motors, v)
-    end
+    if v:IsA("Motor6D") then table.insert(motors, v) end
+end
+print("[diag] Motor6D count:", #motors)
+for i,m in ipairs(motors) do
+    print(string.format("  %d) %s  Part0=%s  Part1=%s", i, m.Name, (m.Part0 and m.Part0.Name or "nil"), (m.Part1 and m.Part1.Name or "nil")))
 end
 
-print(string.format("[diag] Motor6D count = %d", #motors))
-if #motors > 0 then
-    for i,m in ipairs(motors) do
-        local p0 = m.Part0 and m.Part0:GetFullName() or "nil"
-        local p1 = m.Part1 and m.Part1:GetFullName() or "nil"
-        print(string.format("  %d) %s  -- Part0: %s  Part1: %s", i, m.Name, p0, p1))
-    end
-else
-    print("[diag] Warning: no Motor6D found in visual. Это значит анимации не смогут двигать кости.")
-end
-
--- 2) Проверка типа рига по именам частей (простая эвристика)
+-- Detect rig by part names
 local function detectRig()
     local names = {}
     for _,p in ipairs(visual:GetDescendants()) do if p:IsA("BasePart") then names[p.Name] = true end end
-    -- простая проверка
-    if names["UpperTorso"] or names["LowerTorso"] or names["RightUpperArm"] then
-        return "R15"
-    elseif names["Torso"] or names["Right Arm"] or names["Left Leg"] then
-        return "R6"
-    else
-        return "unknown"
-    end
+    if names["UpperTorso"] or names["LowerTorso"] or names["RightUpperArm"] then return "R15" end
+    if names["Torso"] or names["Right Arm"] or names["Left Leg"] then return "R6" end
+    return "unknown"
 end
+local rig = detectRig()
+print("[diag] Detected rig:", rig)
 
-local rigType = detectRig()
-print("[diag] Detected rig (heuristic):", rigType)
-
--- 3) Убираем Anchored у частей, которые контролируются Motor6D (локально)
+-- Ensure parts that Motors control are not anchored (so animation can move them)
 local changed = 0
 for _,m in ipairs(motors) do
-    local p0, p1 = m.Part0, m.Part1
-    for _,t in ipairs({p0, p1}) do
-        if t and t:IsA("BasePart") then
-            if t.Anchored then
-                pcall(function() t.Anchored = false end)
-                changed = changed + 1
-            end
+    for _,p in ipairs({m.Part0, m.Part1}) do
+        if p and p:IsA("BasePart") and p.Anchored then
+            pcall(function() p.Anchored = false end)
+            changed = changed + 1
         end
     end
 end
-print("[diag] Removed Anchored from motorized parts (count changed):", changed)
+print("[diag] Un-anchored motorized parts count:", changed)
 
--- 4) Ensure Animator + Humanoid present
+-- Ensure we have a Humanoid + Animator
 local humanoid = visual:FindFirstChildOfClass("Humanoid")
 if not humanoid then
     humanoid = Instance.new("Humanoid")
-    humanoid.Name = "VisualHumanoid"
+    humanoid.Name = "DiagHumanoid"
     humanoid.Parent = visual
-    print("[diag] Created Visual Humanoid")
+    print("[diag] Created Humanoid in visual")
 else
-    print("[diag] Visual has Humanoid")
+    print("[diag] Visual already has Humanoid")
 end
 
 local animator = humanoid:FindFirstChildOfClass("Animator")
 if not animator then
     animator = Instance.new("Animator")
     animator.Parent = humanoid
-    print("[diag] Created Animator under VisualHumanoid")
+    print("[diag] Created Animator under Humanoid")
 else
-    print("[diag] Animator exists")
+    print("[diag] Animator exists under Humanoid")
 end
 
--- helper load/play function with logging
-local function tryPlay(animId, label)
-    local anim = Instance.new("Animation")
-    anim.AnimationId = animId
-    anim.Parent = visual
-    print("[diag] Trying to LoadAnimation for", label, animId)
-    local ok, trackOrErr = pcall(function() return animator:LoadAnimation(anim) end)
+-- Also try AnimationController route (some custom rigs expect it)
+local controller = visual:FindFirstChildOfClass("AnimationController")
+local ctrlAnimator = nil
+if not controller then
+    controller = Instance.new("AnimationController")
+    controller.Name = "DiagAnimController"
+    controller.Parent = visual
+    ctrlAnimator = Instance.new("Animator"); ctrlAnimator.Parent = controller
+    print("[diag] Created AnimationController + Animator")
+else
+    ctrlAnimator = controller:FindFirstChildOfClass("Animator") or (function() local a=Instance.new("Animator"); a.Parent=controller; return a end)()
+    print("[diag] AnimationController exists")
+end
+
+local function tryLoadAndPlay(anId, who, animatorToUse)
+    if not animatorToUse then print("[diag] no animator for", who); return nil end
+    local a = Instance.new("Animation")
+    a.AnimationId = anId
+    a.Parent = visual
+    print("[diag] Loading animation", anId, "via", who)
+    local ok, track = pcall(function() return animatorToUse:LoadAnimation(a) end)
     if not ok then
-        warn("[diag] LoadAnimation pcall failed:", trackOrErr)
+        print("[diag] LoadAnimation pcall error for", who, track)
         return nil
     end
-    local track = trackOrErr
     if not track then
-        warn("[diag] animator:LoadAnimation returned nil for", animId)
+        print("[diag] animator:LoadAnimation returned nil for", who)
         return nil
     end
-    print("[diag] Loaded track:", track.Name, "Looped:", track.Looped, "Length (may be 0 until loaded):", track.Length)
-    -- connect some signals
-    track.Stopped:Connect(function() print("[diag] track stopped:", label) end)
-    track.KeyframeReached:Connect(function(marker) print("[diag] KeyframeReached:", marker) end)
-    -- play it
+    print("[diag] -> Loaded track (name):", track.Name)
+    -- attempt to play
     local ok2, err2 = pcall(function() track:Play() end)
-    if not ok2 then
-        warn("[diag] track:Play failed:", err2)
-        return nil
-    end
-    print("[diag] track.IsPlaying (after Play):", track.IsPlaying, "Weight:", track:GetStackPriority and track:GetStackPriority() or "n/a")
+    if not ok2 then print("[diag] track:Play failed:", err2); return nil end
+    print("[diag] -> track.IsPlaying after Play:", track.IsPlaying)
     return track
 end
 
--- 5) Попробуем проиграть idle и walk по очереди (с таймаутом)
-local idleTrack = tryPlay(IDLE_ID, "idle")
+-- try play via Humanoid.Animator
+local trackA = tryLoadAndPlay(IDLE_ID, "Humanoid.Animator", animator)
 task.wait(0.6)
-local walkTrack = tryPlay(WALK_ID, "walk")
+local trackB = tryLoadAndPlay(WALK_ID, "Humanoid.Animator", animator)
 task.wait(0.6)
 
-print("[diag] After Play: idleTrack.IsPlaying:", idleTrack and idleTrack.IsPlaying or "nil", "walkTrack.IsPlaying:", walkTrack and walkTrack.IsPlaying or "nil")
+-- try play via AnimationController.Animator
+local trackC = tryLoadAndPlay(IDLE_ID, "AnimationController.Animator", ctrlAnimator)
+task.wait(0.6)
+local trackD = tryLoadAndPlay(WALK_ID, "AnimationController.Animator", ctrlAnimator)
+task.wait(0.6)
 
--- 6) Простейший тест управления Motor6D: коротким циклом изменим C0 первого моторчика, чтобы увидеть движение
+print("[diag] Status: Humanoid-tracks:", (trackA and trackA.IsPlaying) and "idle-playing" or tostring(trackA), (trackB and trackB.IsPlaying) and "walk-playing" or tostring(trackB))
+print("[diag] Status: Controller-tracks:", (trackC and trackC.IsPlaying) and "idle-playing" or tostring(trackC), (trackD and trackD.IsPlaying) and "walk-playing" or tostring(trackD))
+
+-- manual Motor6D test: rotate first motor small amount back/forth
 if #motors > 0 then
     local m = motors[1]
-    local origC0 = m.C0
-    print("[diag] Testing manual Motor6D movement on:", m.Name, "Part1:", m.Part1 and m.Part1.Name)
-    -- small rotation test
+    local orig = m.C0
+    print("[diag] Manual motor test on:", m.Name, "Part1:", (m.Part1 and m.Part1.Name or "nil"))
     for i=1,6 do
-        local a = (i%2==0) and 0.15 or -0.15
-        pcall(function() m.C0 = origC0 * CFrame.Angles(a,0,0) end)
-        task.wait(0.25)
+        local ang = (i%2==0) and 0.25 or -0.25
+        pcall(function() m.C0 = orig * CFrame.Angles(ang,0,0) end)
+        task.wait(0.18)
     end
-    pcall(function() m.C0 = origC0 end)
-    print("[diag] Manual Motor6D test done")
+    pcall(function() m.C0 = orig end)
+    print("[diag] Manual motor test done")
 else
-    print("[diag] No motors to test manual movement")
+    print("[diag] No Motor6D found - model cannot be animated by standard humanoid animations")
 end
 
-print("[diag] DIAGNOSTIC COMPLETE. If animation still doesn't move the model, copy all above output and paste here.")
+print("[diag] DIAGNOSTIC FINISHED - paste all output here.")
