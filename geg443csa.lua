@@ -1,271 +1,275 @@
--- local-visual-morph-clean.lua
--- Клиентский, инжекторный. Создаёт локальную визуальную копию (Deer) и проигрывает анимации.
--- Откат: revertLocalMorph()
+-- visual-morph-clean-fixed.lua  (client / injector)
+-- Фиксы: offset для позиционирования, HipHeight для реального char, улучшенные tools, FP cleanup.
 
-local TEMPLATE_NAMES = {"Deer", "Deer_LOCAL"} -- возможные имена шаблона
-local IDLE_ID = "rbxassetid://138304500572165"
-local WALK_ID = "rbxassetid://78826693826761"
+local MODEL_NAME = "Deer" -- в workspace.Deer
+local IDLE_ID    = "rbxassetid://138304500572165" -- проверь ID, они подозрительно длинные
+local WALK_ID    = "rbxassetid://78826693826761"
+local VISUAL_NAME = "LOCAL_VISUAL_DEER"
+local SMOOTH = 0.45
+local FP_HIDE_DISTANCE = 0.6
+local HIP_OFFSET = 0  -- авто-расчёт ниже; если не ок, поставь вручную (высота разницы, напр. 2.5 для высокого Deer)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-
 local lp = Players.LocalPlayer
-if not lp then warn("[morph] LocalPlayer not found"); return end
-local char = lp.Character or lp.CharacterAdded:Wait()
+if not lp then warn("No LocalPlayer") return end
 
-local VISUAL_NAME = "LOCAL_VISUAL_DEER"
-local FP_HIDE_DISTANCE = 0.6 -- порог для прятания визуала в FP
-local SMOOTH = 0.5 -- сглаживание следования (0..1)
-local EXTRA_VERTICAL_OFFSET = 0.02 -- если ноги всё ещё чуть врезаются, увеличь
+local function findTemplate()
+    local t = workspace:FindFirstChild(MODEL_NAME)
+    if t and t:IsA("Model") then return t end
+    return nil
+end
 
+local template = findTemplate()
+if not template then warn("Template model '"..MODEL_NAME.."' not found in workspace") return end
+
+-- state
 local visual = nil
 local visualHum = nil
 local animator = nil
 local idleTrack, walkTrack = nil, nil
 local followConn = nil
-local chatBubbles = {}
+local toolConns = {}
+local spawnedToolVisuals = {}
+local cam = workspace.CurrentCamera
+local originalHipHeight = nil  -- для revert
 
-local function log(...) print("[morph]", ...) end
-local function warnlog(...) warn("[morph]", ...) end
-
--- найти шаблон
-local function findTemplate()
-    for _, name in ipairs(TEMPLATE_NAMES) do
-        local m = workspace:FindFirstChild(name)
-        if m and m:IsA("Model") then return m end
-    end
-    -- fallback: ищем 'deer' в имени
-    for _, m in ipairs(workspace:GetChildren()) do
-        if m:IsA("Model") and tostring(m.Name):lower():find("deer") then return m end
+-- helpers
+local function safeFindPart(model, names)
+    for _,n in ipairs(names) do
+        local p = model:FindFirstChild(n, true)
+        if p and p:IsA("BasePart") then return p end
     end
     return nil
 end
 
--- низ модели (нижняя Y координата)
-local function lowestYOfModel(m)
-    if not m then return nil end
-    local minY = math.huge
-    for _, part in ipairs(m:GetDescendants()) do
-        if part:IsA("BasePart") then
-            local bottom = part.Position.Y - part.Size.Y/2
-            if bottom < minY then minY = bottom end
+local function setLocalVisibility(model, visible, excludeArms)
+    for _,v in ipairs(model:GetDescendants()) do
+        if v:IsA("BasePart") then
+            if excludeArms and (string.find(v.Name:lower(), "arm") or string.find(v.Name:lower(), "hand")) then
+                -- skip arms/hands for FP
+            else
+                pcall(function() v.LocalTransparencyModifier = visible and 0 or 1 end)
+            end
         end
     end
-    if minY == math.huge then return nil end
-    return minY
 end
 
--- самая верхняя часть модели (для chat billboard)
-local function highestPartOfModel(m)
-    if not m then return nil end
-    local bestPart = nil
-    local bestY = -math.huge
-    for _, part in ipairs(m:GetDescendants()) do
-        if part:IsA("BasePart") then
-            local top = part.Position.Y + part.Size.Y/2
-            if top > bestY then bestY = top; bestPart = part end
-        end
-    end
-    return bestPart
+local function isFirstPerson()
+    if not cam then return false end
+    local char = lp.Character
+    if not char then return false end
+    local head = char:FindFirstChild("Head")
+    if not head then return false end
+    local dist = (cam.CFrame.Position - head.Position).Magnitude
+    return dist < FP_HIDE_DISTANCE
 end
 
--- сброс старого визуала
-local function cleanupVisual()
-    if followConn then followConn:Disconnect(); followConn = nil end
-    -- удалить все локальные пузырьки чата
-    for _,v in pairs(chatBubbles) do
-        pcall(function() v:Destroy() end)
+local function loadTrackFromId(animatorObj, id)
+    if not animatorObj or not id then return nil end
+    local a = Instance.new("Animation")
+    a.AnimationId = id
+    a.Parent = animatorObj
+    local ok, tr = pcall(function() return animatorObj:LoadAnimation(a) end)
+    if not ok or not tr then
+        warn("LoadAnimation failed:", id, tr)
+        a:Destroy()
+        return nil
     end
-    chatBubbles = {}
-    -- остановить треки
-    pcall(function()
-        if idleTrack and idleTrack.IsPlaying then idleTrack:Stop() end
-        if walkTrack and walkTrack.IsPlaying then walkTrack:Stop() end
-    end)
-    idleTrack = nil; walkTrack = nil
-    -- удалить animator/humanoid если были
-    pcall(function()
-        if animator and animator.Parent then animator:Destroy() end
-        if visualHum and visualHum.Parent then visualHum:Destroy() end
-    end)
-    -- удалить сам визуал
-    if visual and visual.Parent then
-        pcall(function() visual:Destroy() end)
-    end
-    visual = nil
-    animator = nil
-    visualHum = nil
-    log("Local visual cleaned up.")
+    tr.Priority = Enum.AnimationPriority.Movement
+    return tr
 end
 
--- показать локальный чат-пузырь над визуальной головой
-local function showLocalChat(text, dur)
-    dur = dur or 4
+-- tool visual: clone WHOLE tool and attach
+local function createToolVisual(tool)
     if not visual then return end
-    local head = highestPartOfModel(visual)
-    if not head then return end
-    local playerGui = lp:FindFirstChild("PlayerGui")
-    if not playerGui then return end
-
-    local bb = Instance.new("BillboardGui")
-    bb.Name = "LOCAL_CHAT_BB"
-    bb.Adornee = head
-    bb.Parent = playerGui
-    bb.Size = UDim2.new(0,200,0,50)
-    bb.StudsOffset = Vector3.new(0, head.Size.Y/2 + 0.5, 0)
-    bb.AlwaysOnTop = true
-
-    local txt = Instance.new("TextLabel")
-    txt.Size = UDim2.new(1,0,1,0)
-    txt.BackgroundTransparency = 0.35
-    txt.BackgroundColor3 = Color3.new(0,0,0)
-    txt.TextColor3 = Color3.new(1,1,1)
-    txt.TextStrokeTransparency = 0.7
-    txt.TextScaled = true
-    txt.Font = Enum.Font.SourceSansSemibold
-    txt.Text = text
-    txt.Parent = bb
-
-    table.insert(chatBubbles, bb)
-    task.delay(dur, function()
-        pcall(function() bb:Destroy() end)
-    end)
-end
-
--- загружаем анимации в animator (локально)
-local function loadAnimations(animatorObj)
-    if not animatorObj then return end
-    local function safeLoad(id)
-        if not id or id == "" then return nil end
-        local a = Instance.new("Animation")
-        a.AnimationId = id
-        a.Parent = animatorObj
-        local ok, track = pcall(function() return animatorObj:LoadAnimation(a) end)
-        if not ok or not track then
-            warnlog("LoadAnimation failed for", id, track)
-            pcall(function() a:Destroy() end)
-            return nil
-        end
-        track.Priority = Enum.AnimationPriority.Movement
-        return track
+    local visualTool = tool:Clone()
+    visualTool.Name = "VISUAL_"..(tool.Name or "Tool")
+    visualTool.Parent = visual
+    for _,p in ipairs(visualTool:GetDescendants()) do
+        if p:IsA("BasePart") then p.CanCollide = false end
     end
-    local idle = safeLoad(IDLE_ID)
-    local walk = safeLoad(WALK_ID)
-    if idle then pcall(function() idle.Looped = true; idle:Play() end) end
-    return idle, walk
+
+    local hand = safeFindPart(visual, {"RightHand","Right Arm","RightHand","RightUpperArm","RightArm"})
+    if not hand then hand = visual.PrimaryPart end
+
+    local handle = visualTool:FindFirstChild("Handle") or visualTool:FindFirstChildWhichIsA("BasePart")
+    if not handle then return end
+
+    -- attachments
+    local attV = Instance.new("Attachment"); attV.Parent = handle
+    local attH = Instance.new("Attachment"); attH.Parent = hand
+
+    local ap = Instance.new("AlignPosition"); ap.Attachment0 = attV; ap.Attachment1 = attH
+    ap.Responsiveness = 200; ap.MaxForce = 1e5; ap.RigidityEnabled = true; ap.Parent = handle
+    local ao = Instance.new("AlignOrientation"); ao.Attachment0 = attV; ao.Attachment1 = attH
+    ao.Responsiveness = 200; ao.MaxTorque = 1e5; ao.RigidityEnabled = true; ao.Parent = handle
+
+    return visualTool, {ap=ap, ao=ao, attV=attV, attH=attH}
 end
 
--- основной create visual
+local function cleanupToolVisuals()
+    for k,v in pairs(spawnedToolVisuals) do
+        if v.instance and v.instance.Parent then pcall(function() v.instance:Destroy() end) end
+    end
+    spawnedToolVisuals = {}
+    for k,c in pairs(toolConns) do
+        if c then c:Disconnect() end
+    end
+    toolConns = {}
+end
+
+-- main create visual
 local function createVisual()
-    cleanupVisual()
-
-    local template = findTemplate()
-    if not template then warnlog("Template not found in workspace"); return false end
-
+    if visual and visual.Parent then return visual end
     local ok, clone = pcall(function() return template:Clone() end)
-    if not ok or not clone then warnlog("Failed to clone template:", clone); return false end
+    if not ok or not clone then warn("Clone failed:", clone) return nil end
+
     clone.Name = VISUAL_NAME
 
-    -- sanitize: удалить все Scripts/ModuleScripts/Humanoid чтобы не было конфликтов
+    -- sanitize
     for _,d in ipairs(clone:GetDescendants()) do
-        if d:IsA("Script") or d:IsA("ModuleScript") or d:IsA("Humanoid") then
-            pcall(function() d:Destroy() end)
-        end
+        if d:IsA("Script") or d:IsA("ModuleScript") then pcall(function() d:Destroy() end) end
+        if d:IsA("Humanoid") then pcall(function() d:Destroy() end) end
         if d:IsA("BasePart") then
-            pcall(function() d.Anchored = false; d.CanCollide = false end)
+            pcall(function() d.CanCollide = false; d.Anchored = false end)
         end
     end
 
-    -- set primary
     local prim = clone:FindFirstChild("HumanoidRootPart", true) or clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart", true)
     if prim then clone.PrimaryPart = prim end
 
-    -- parent now so positions are meaningful
     clone.Parent = workspace
     visual = clone
 
-    -- compute vertical alignment: align visual feet to player's feet
-    local playerFeetY = lowestYOfModel(char)
-    local visualFeetY = lowestYOfModel(visual)
-    if playerFeetY and visualFeetY then
-        local deltaY = playerFeetY - visualFeetY + EXTRA_VERTICAL_OFFSET
-        if visual.PrimaryPart then
-            pcall(function()
-                visual:SetPrimaryPartCFrame(visual.PrimaryPart.CFrame * CFrame.new(0, deltaY, 0))
-            end)
-            log("Applied vertical shift:", deltaY)
-        else
-            warnlog("visual has no PrimaryPart; can't set CFrame exact")
-        end
-    else
-        warnlog("Couldn't compute feet Y for alignment; playerFeetY:", playerFeetY, "visualFeetY:", visualFeetY)
+    visualHum = Instance.new("Humanoid")
+    visualHum.Name = "VisualHumanoid"
+    visualHum.Parent = visual
+    animator = Instance.new("Animator"); animator.Parent = visualHum
+
+    idleTrack = loadTrackFromId(animator, IDLE_ID)
+    walkTrack = loadTrackFromId(animator, WALK_ID)
+    if idleTrack then pcall(function() idleTrack.Looped = true; idleTrack:Play() end) end
+    if walkTrack then pcall(function() walkTrack.Looped = true end) end  -- добавил looped для walk
+
+    local char = lp.Character or lp.CharacterAdded:Wait()
+    local realHum = char:FindFirstChildOfClass("Humanoid")
+    if realHum then
+        originalHipHeight = realHum.HipHeight
+        -- авто-offset: примерный, тесть и подкрути
+        local visualHeight = visual:GetExtentsSize().Y
+        local realHeight = char:GetExtentsSize().Y
+        HIP_OFFSET = (visualHeight - realHeight) / 2  -- половина разницы, чтобы ноги на земле
+        pcall(function() realHum.HipHeight = realHum.HipHeight + HIP_OFFSET end)  -- поднимаем реальный char
     end
 
-    -- create a Humanoid+Animator for visual so animations affect Motor6D
-    visualHum = Instance.new("Humanoid")
-    visualHum.Name = "LocalVisualHumanoid"
-    visualHum.Parent = visual
-    animator = Instance.new("Animator")
-    animator.Parent = visualHum
+    setLocalVisibility(char, false)  -- hide real
 
-    -- load animations locally
-    idleTrack, walkTrack = loadAnimations(animator)
+    -- tools
+    local function onToolEquipped(tool)
+        pcall(function() setLocalVisibility(tool, false) end)  -- hide real tool
+        local vt, info = createToolVisual(tool)
+        if vt then spawnedToolVisuals[tool] = {instance = vt, info = info} end
+    end
+    local function onToolUnequipped(tool)
+        local data = spawnedToolVisuals[tool]
+        if data and data.instance then pcall(function() data.instance:Destroy() end) end
+        spawnedToolVisuals[tool] = nil
+        pcall(function() setLocalVisibility(tool, true) end)  -- show real if needed
+    end
 
-    -- chat hooking: show local bubble when local player chats
-    local chatConn
-    chatConn = lp.Chatted:Connect(function(msg)
-        pcall(function() showLocalChat(msg, 4) end)
-    end)
-
-    -- follow loop: track player's HRP with smoothing
-    local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
-    if not hrp then warnlog("Player HRP not found"); end
-
-    followConn = RunService.Heartbeat:Connect(function()
-        if not visual or not visual.PrimaryPart or not hrp then return end
-        -- FP hide: if camera close to player's head, hide visual
-        local cam = workspace.CurrentCamera
-        if cam then
-            local head = char:FindFirstChild("Head") or char:FindFirstChildWhichIsA("BasePart", true)
-            if head then
-                local dist = (cam.CFrame.Position - head.Position).Magnitude
-                if dist < FP_HIDE_DISTANCE then
-                    -- hide visual parts locally
-                    for _,p in ipairs(visual:GetDescendants()) do
-                        if p:IsA("BasePart") then
-                            p.LocalTransparencyModifier = 1
-                        end
-                    end
-                else
-                    for _,p in ipairs(visual:GetDescendants()) do
-                        if p:IsA("BasePart") then
-                            p.LocalTransparencyModifier = 0
-                        end
-                    end
-                end
+    local function bindToolEventsToContainer(container)
+        if not container then return end
+        for _,item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") then
+                toolConns[item] = item.Equipped:Connect(function() onToolEquipped(item) end)
+                toolConns[item .. "_uneq"] = item.Unequipped:Connect(function() onToolUnequipped(item) end)
             end
         end
+        container.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") then
+                toolConns[child] = child.Equipped:Connect(function() onToolEquipped(child) end)
+                toolConns[child .. "_uneq"] = child.Unequipped:Connect(function() onToolUnequipped(child) end)
+            end
+        end)
+    end
 
-        -- follow HRP smoothly
-        local target = hrp.CFrame
-        local cur = visual.PrimaryPart.CFrame
-        local new = cur:Lerp(target, SMOOTH)
-        pcall(function() visual:SetPrimaryPartCFrame(new) end)
+    bindToolEventsToContainer(lp:FindFirstChildOfClass("Backpack"))
+    if char then bindToolEventsToContainer(char) end
+    lp.CharacterAdded:Connect(function(newChar)
+        bindToolEventsToContainer(newChar)
+        local newHum = newChar:WaitForChild("Humanoid", 5)
+        if newHum then pcall(function() newHum.HipHeight = newHum.HipHeight + HIP_OFFSET end) end
+        setLocalVisibility(newChar, false)
     end)
 
-    log("Local visual created:", visual:GetFullName())
-    return true
+    -- follow
+    local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+    if not hrp then warn("No HRP") return end
+
+    if followConn then followConn:Disconnect() end
+    followConn = RunService.RenderStepped:Connect(function()
+        if not visual or not visual.PrimaryPart or not hrp then return end
+        local fp = isFirstPerson()
+        if fp then
+            -- FP: show real (only arms), hide visual fully + visual tools
+            setLocalVisibility(visual, false)
+            for _,data in pairs(spawnedToolVisuals) do
+                if data.instance then setLocalVisibility(data.instance, false) end
+            end
+            setLocalVisibility(char, true, true)  -- show real, but hide non-arms for full FP
+        else
+            -- TP: show visual, hide real
+            setLocalVisibility(visual, true)
+            for _,data in pairs(spawnedToolVisuals) do
+                if data.instance then setLocalVisibility(data.instance, true) end
+            end
+            setLocalVisibility(char, false)
+        end
+        -- lerp with offset: visual ниже на HIP_OFFSET, чтобы ноги на земле (реальный выше)
+        local target = hrp.CFrame * CFrame.new(0, -HIP_OFFSET, 0)  -- сдвиг вниз
+        local cur = visual.PrimaryPart.CFrame
+        local new = cur:Lerp(target, SMOOTH)
+        visual:SetPrimaryPartCFrame(new)
+    end)
+
+    -- anim switch
+    if realHum and walkTrack then
+        realHum.Running:Connect(function(speed)
+            if speed > 0.5 then
+                if idleTrack and idleTrack.IsPlaying then pcall(function() idleTrack:Stop(0.12) end) end
+                if walkTrack and not walkTrack.IsPlaying then pcall(function() walkTrack:Play() end) end
+            else
+                if walkTrack and walkTrack.IsPlaying then pcall(function() walkTrack:Stop(0.12) end) end
+                if idleTrack and not idleTrack.IsPlaying then pcall(function() idleTrack:Play() end) end
+            end
+        end)
+    end
+
+    return visual
 end
 
--- revert function
-local function revertLocalMorph()
-    cleanupVisual()
-    log("revertLocalMorph called.")
+-- revert
+local function revertMorph()
+    if followConn then followConn:Disconnect(); followConn = nil end
+    cleanupToolVisuals()
+    if visual then pcall(function() visual:Destroy() end) end
+    visual = nil; animator = nil; idleTrack = nil; walkTrack = nil
+    local char = lp.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum and originalHipHeight then pcall(function() hum.HipHeight = originalHipHeight end) end
+        setLocalVisibility(char, true)
+    end
+    print("Morph reverted.")
 end
 
--- expose revert globally
-_G.revertLocalMorph = revertLocalMorph
+local v = createVisual()
+if v then
+    print("Local visual created:", v:GetFullName())
+    print("To revert: revertMorph() in console.")
+else
+    warn("Failed.")
+end
 
--- run
-local success = createVisual()
-if not success then warnlog("createVisual failed") end
+_G.revertMorph = revertMorph
