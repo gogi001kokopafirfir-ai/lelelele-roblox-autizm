@@ -1,7 +1,8 @@
 -- morph-deer-inject-fixed-v2.lua  (client / injector)
--- Fixes: Tools attach (fixed near Deer), HipHeight manual (pass doors with clip), anim checks.
+-- Фиксы: Manual tool attach (fixed near Deer), HipHeight adjust for doors/height.
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 
 local lp = Players.LocalPlayer
@@ -13,9 +14,12 @@ if not TEMPLATE then warn("Deer not found") return end
 local IDLE_ID = "rbxassetid://138304500572165"  -- тесть ID в Studio
 local WALK_ID = "rbxassetid://78826693826761"
 
+local HIP_HEIGHT_ADJUST = 1.8  -- тесть 1.5-2.0 для дверей (меньше = ниже, влезает, но может утопать)
+local TOOL_OFFSET = CFrame.new(1.5, 0, 0)  -- right side fix; тесть для visible
+
 local AUTO_MORPH_ON_LOAD = true
 local morphedData = {}
-local originalHipHeight = nil  -- store for revert
+local toolAttachConn = nil  -- for cleanup
 
 local function getRoot(model)
     return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
@@ -33,7 +37,7 @@ local function loadAnim(animator, id, looped, priority)
     anim.AnimationId = id
     local success, track = pcall(animator.LoadAnimation, animator, anim)
     if not success then
-        warn("Failed load anim " .. id .. ": " .. tostring(track))
+        warn("Failed load " .. id .. ": " .. tostring(track))
         anim:Destroy()
         return nil
     end
@@ -48,7 +52,7 @@ local function setupAnims(char)
     local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
     local idle = loadAnim(animator, IDLE_ID, true)
     local walk = loadAnim(animator, WALK_ID, true)
-    if not idle or not walk then return nil, nil, nil end
+    if not idle or not walk then warn("Anims fail — check IDs/rig") return nil, nil, nil end
     idle:Play()
 
     local conn = hum.Running:Connect(function(speed)
@@ -64,23 +68,22 @@ local function setupAnims(char)
     return idle, walk, conn
 end
 
-local function attachToolToChar(tool, char)
-    local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
-    if not handle then warn("No handle in tool: " .. tool.Name) return end
-
-    -- disable physics
-    handle.CanCollide = false
-    handle.Anchored = true  -- prevent fall
-
-    local hand = char:FindFirstChild("RightHand", true) or char:FindFirstChild("RightArm", true)
-    if not hand then hand = getRoot(char) warn("No hand — fallback to root") end
-
-    -- weld for fixed pos
-    local weld = Instance.new("Weld")
-    weld.Part0 = handle
-    weld.Part1 = hand
-    weld.C0 = CFrame.new(1, 0, 0)  -- offset: adjust (x,y,z) for "nearby" pos, e.g. (2,1,-1) for right side
-    weld.Parent = handle
+local function attachTools(char)
+    if toolAttachConn then toolAttachConn:Disconnect() end
+    local root = getRoot(char)
+    if not root then return end
+    toolAttachConn = RunService.Heartbeat:Connect(function()
+        for _, tool in ipairs(char:GetChildren()) do
+            if tool:IsA("Tool") then
+                local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+                if handle then
+                    handle.CanCollide = false  -- no fall
+                    handle.Anchored = true  -- fixed
+                    handle.CFrame = root.CFrame * TOOL_OFFSET  -- fixed near
+                end
+            end
+        end
+    end)
 end
 
 local function morphPlayer(plr)
@@ -88,8 +91,6 @@ local function morphPlayer(plr)
 
     local oldChar = plr.Character or plr.CharacterAdded:Wait()
     if not oldChar then warn("No old char") return end
-    local oldHum = oldChar:FindFirstChildOfClass("Humanoid")
-    if oldHum then originalHipHeight = oldHum.HipHeight end  -- store original
 
     local clone = TEMPLATE:Clone()
     clone.Name = plr.Name
@@ -103,42 +104,28 @@ local function morphPlayer(plr)
     clone.Parent = workspace
 
     local idle, walk, animConn = setupAnims(clone)
-    if not idle then warn("Anims fail — abort") clone:Destroy() return end
+    if not idle then warn("Anims failed — abort") clone:Destroy() return end
+
+    local hum = clone:FindFirstChildOfClass("Humanoid")
+    if hum then
+        hum.HipHeight = HIP_HEIGHT_ADJUST  -- fix height/doors
+    end
 
     local success = pcall(function() plr.Character = clone end)
-    if not success then warn("Set char fail") clone:Destroy() return end
+    if not success then warn("Set char fail — injector?") clone:Destroy() return end
     safeSetCamera(clone)
-
-    -- fix hipheight for doors (set to original — clip ok)
-    local newHum = clone:FindFirstChildOfClass("Humanoid")
-    if newHum and originalHipHeight then
-        newHum.HipHeight = originalHipHeight  -- lower to pass doors
-        print("Set HipHeight to original:", originalHipHeight)
-    end
 
     -- tools transfer + attach
     local backpack = plr:FindFirstChildOfClass("Backpack")
     if backpack then
         for _, tool in ipairs(backpack:GetChildren()) do
-            if tool:IsA("Tool") then
-                tool.Parent = clone
-                attachToolToChar(tool, clone)
-            end
+            if tool:IsA("Tool") then tool.Parent = clone end
         end
     end
     for _, tool in ipairs(oldChar:GetChildren()) do
-        if tool:IsA("Tool") then
-            tool.Parent = clone
-            attachToolToChar(tool, clone)
-        end
+        if tool:IsA("Tool") then tool.Parent = clone end
     end
-
-    -- monitor new tools (backpack/childadded)
-    if backpack then
-        backpack.ChildAdded:Connect(function(child)
-            if child:IsA("Tool") then attachToolToChar(child, clone) end
-        end)
-    end
+    attachTools(clone)  -- manual fix
 
     morphedData[plr.UserId] = {oldChar = oldChar, newChar = clone, idleTrack = idle, walkTrack = walk, animConn = animConn}
 
@@ -149,6 +136,7 @@ local function revertPlayer(plr)
     local data = morphedData[plr.UserId]
     if not data then return end
 
+    if toolAttachConn then toolAttachConn:Disconnect(); toolAttachConn = nil end
     if data.animConn then data.animConn:Disconnect() end
     if data.idleTrack then data.idleTrack:Stop() end
     if data.walkTrack then data.walkTrack:Stop() end
