@@ -1,7 +1,8 @@
--- morph-replace-clean-fixed.lua
--- Клиент: аккуратная замена LocalPlayer.Character на шаблон (Deer)
--- Настройки:
-local TEMPLATE_NAMES = {"Deer", "Deer_LOCAL"} -- возможные имена шаблона
+-- morph-replace-simple-injector.lua
+-- Клиентский/инжекторный скрипт: аккуратно заменяет LocalPlayer.Character на шаблон и локально проигрывает анимации.
+-- Настрой: поменяй TEMPLATE_NAMES, IDLE_ID, WALK_ID при необходимости.
+
+local TEMPLATE_NAMES = {"Deer", "Deer_LOCAL"} -- имена шаблона в workspace (в порядке приоритета)
 local IDLE_ID = "rbxassetid://138304500572165"
 local WALK_ID = "rbxassetid://78826693826761"
 
@@ -16,13 +17,14 @@ local oldChar = lp.Character or lp.CharacterAdded:Wait()
 local function log(...) print("[morph]", ...) end
 local function warnlog(...) warn("[morph]", ...) end
 
+-- helper: find template model in workspace
 local function findTemplate()
     for _, name in ipairs(TEMPLATE_NAMES) do
         local m = workspace:FindFirstChild(name)
         if m and m:IsA("Model") then return m end
     end
     for _, m in ipairs(workspace:GetChildren()) do
-        if m:IsA("Model") and string.find(string.lower(m.Name or ""), "deer") then return m end
+        if m:IsA("Model") and string.find(string.lower(m.Name or ""), "deer", 1, true) then return m end
     end
     return nil
 end
@@ -38,7 +40,7 @@ local function lowestYOfModel(m)
     local minY = math.huge
     for _, part in ipairs(m:GetDescendants()) do
         if part:IsA("BasePart") then
-            local bottom = part.Position.Y - part.Size.Y/2
+            local bottom = part.Position.Y - part.Size.Y / 2
             if bottom < minY then minY = bottom end
         end
     end
@@ -50,7 +52,7 @@ local function prepareClone(orig)
     local ok, clone = pcall(function() return orig:Clone() end)
     if not ok or not clone then warnlog("Clone failed:", clone); return nil end
 
-    -- удаляем серверные скрипты/модули и humanoid внутри шаблона (чтобы не было конфликтов)
+    -- remove server scripts/modules/humanoids inside template to avoid conflicts
     for _, d in ipairs(clone:GetDescendants()) do
         if d:IsA("Script") or d:IsA("ModuleScript") or d:IsA("Humanoid") then
             pcall(function() d:Destroy() end)
@@ -70,99 +72,80 @@ local function copyStarterLocalScriptsToClone(clone)
     for _, child in ipairs(folder:GetChildren()) do
         if child:IsA("LocalScript") then
             local ok, c = pcall(function() return child:Clone() end)
-            if ok and c then c.Parent = clone; log("Copied LocalScript:", c.Name) end
+            if ok and c then c.Parent = clone; log("Copied Starter LocalScript:", c.Name) end
         end
     end
 end
 
 local function transferTools(oldChar, newChar)
+    if not lp then return end
     local bp = lp:FindFirstChildOfClass("Backpack")
     local function move(tool)
         if tool and tool:IsA("Tool") then
             pcall(function() tool.Parent = newChar end)
         end
     end
-    if bp then for _,t in ipairs(bp:GetChildren()) do move(t) end end
-    if oldChar then for _,t in ipairs(oldChar:GetChildren()) do if t:IsA("Tool") then move(t) end end end
-end
-
--- Вставляем компактный LocalScript внутрь клона; он будет выполняться уже в контексте character.
--- LocalScript читает атрибуты clone: "MorphIdle" и "MorphWalk".
-local LOCAL_SCRIPT_SOURCE =
--- __MORPH_ANIM_LOCAL (внутри клона)
-local RunService = game:GetService("RunService")
-local Players = game:GetService("Players")
-local lp = Players.LocalPlayer
-local char = script.Parent
-
-local idleId = char:GetAttribute("MorphIdle") or ""
-local walkId = char:GetAttribute("MorphWalk") or ""
-
-local humanoid = char:WaitForChild("Humanoid", 5)
-if not humanoid then warn("[morph-local] Humanoid not found"); return end
-
-local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
-
-local function safeLoad(animId)
-    if not animId or animId == "" then return nil end
-    local a = Instance.new("Animation")
-    a.AnimationId = animId
-    a.Parent = script
-    local ok, track = pcall(function() return animator:LoadAnimation(a) end)
-    if not ok or not track then warn("[morph-local] LoadAnimation failed:", animId, track); pcall(function() a:Destroy() end); return nil end
-    track.Priority = Enum.AnimationPriority.Movement
-    return track
-end
-
-local idleTrack = safeLoad(idleId)
-local walkTrack = safeLoad(walkId)
-if idleTrack then pcall(function() idleTrack.Looped = true; idleTrack:Play() end) end
-
-if walkTrack then
-    humanoid.Running:Connect(function(speed)
-        if speed and speed > 0.5 then
-            if idleTrack and idleTrack.IsPlaying then pcall(function() idleTrack:Stop(0.12) end) end
-            if walkTrack and not walkTrack.IsPlaying then pcall(function() walkTrack:Play() end) end
-        else
-            if walkTrack and walkTrack.IsPlaying then pcall(function() walkTrack:Stop(0.12) end) end
-            if idleTrack and not idleTrack.IsPlaying then pcall(function() idleTrack:Play() end) end
+    if bp then
+        for _, t in ipairs(bp:GetChildren()) do move(t) end
+    end
+    if oldChar then
+        for _, t in ipairs(oldChar:GetChildren()) do
+            if t:IsA("Tool") then move(t) end
         end
-    end)
-end
-
--- простой FP handling: прятать части клона при близкой камере (чтобы не клипало)
-local cam = workspace.CurrentCamera
-local FP_HIDE_DISTANCE = 0.6
-local function setLocalVis(character, visible)
-    for _,p in ipairs(character:GetDescendants()) do
-        if p:IsA("BasePart") then p.LocalTransparencyModifier = visible and 0 or 1 end
     end
 end
 
-local head = char:FindFirstChild("Head", true) or char:FindFirstChildWhichIsA("BasePart", true)
-if head then
-    RunService.RenderStepped:Connect(function()
-        if not cam or not head then return end
-        local d = (cam.CFrame.Position - head.Position).Magnitude
-        if d < FP_HIDE_DISTANCE then
-            setLocalVis(char, false)
-        else
-            setLocalVis(char, true)
+-- FP local hiding helper (local only)
+local function setLocalVisibility(character, visible)
+    for _, v in ipairs(character:GetDescendants()) do
+        if v:IsA("BasePart") then
+            pcall(function() v.LocalTransparencyModifier = visible and 0 or 1 end)
         end
-    end)
+    end
 end
 
-print("[morph-local] init done")
+-- safe animation loader (executed in injector, client-side)
+local function loadAndPlayAnimationsOn(humanoid, idleId, walkId)
+    if not humanoid then return nil end
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then animator = Instance.new("Animator"); animator.Parent = humanoid end
 
-local function insertLocalScriptToClone(clone)
-    local ls = Instance.new("LocalScript")
-    ls.Name = "__MORPH_ANIM_LOCAL"
-    ls.Source = LOCAL_SCRIPT_SOURCE
-    ls.Parent = clone
-    return ls
+    local function safeLoad(id)
+        if not id or id == "" then return nil end
+        local anim = Instance.new("Animation")
+        anim.AnimationId = id
+        anim.Parent = humanoid
+        local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
+        if not ok or not track then
+            warn("[morph] LoadAnimation failed:", id, track)
+            pcall(function() anim:Destroy() end)
+            return nil
+        end
+        track.Priority = Enum.AnimationPriority.Movement
+        return track
+    end
+
+    local idleTrack = safeLoad(idleId)
+    local walkTrack = safeLoad(walkId)
+
+    if idleTrack then pcall(function() idleTrack.Looped = true; idleTrack:Play() end) end
+
+    if walkTrack then
+        humanoid.Running:Connect(function(speed)
+            if speed and speed > 0.5 then
+                if idleTrack and idleTrack.IsPlaying then pcall(function() idleTrack:Stop(0.12) end) end
+                if walkTrack and not walkTrack.IsPlaying then pcall(function() walkTrack:Play() end) end
+            else
+                if walkTrack and walkTrack.IsPlaying then pcall(function() walkTrack:Stop(0.12) end) end
+                if idleTrack and not idleTrack.IsPlaying then pcall(function() idleTrack:Play() end) end
+            end
+        end)
+    end
+
+    return {idle = idleTrack, walk = walkTrack}
 end
 
--- main morph routine
+-- main morph procedure
 local function doMorph()
     local template = findTemplate()
     if not template then warnlog("Template not found"); return end
@@ -170,44 +153,37 @@ local function doMorph()
     local newChar = prepareClone(template)
     if not newChar then warnlog("prepareClone failed"); return end
 
-    -- position newChar at oldChar pivot
+    -- try position clone at old character pivot
     setPrimaryIfMissing(newChar)
     local oldPivot = (oldChar.GetPivot and oldChar:GetPivot()) or (oldChar.PrimaryPart and oldChar.PrimaryPart.CFrame)
     if oldPivot and newChar.PrimaryPart then
         pcall(function() newChar:SetPrimaryPartCFrame(oldPivot) end)
     end
 
-    -- vertical align by lowest Y
-    local playerFeet = lowestYOfModel(oldChar)
-    local cloneFeet = lowestYOfModel(newChar)
-    if playerFeet and cloneFeet and newChar.PrimaryPart then
-        local delta = playerFeet - cloneFeet
+    -- vertical alignment by feet
+    local playerFeetY = lowestYOfModel(oldChar)
+    local cloneFeetY = lowestYOfModel(newChar)
+    if playerFeetY and cloneFeetY and newChar.PrimaryPart then
+        local delta = playerFeetY - cloneFeetY
         if math.abs(delta) > 1e-5 then
             pcall(function() newChar:SetPrimaryPartCFrame(newChar.PrimaryPart.CFrame * CFrame.new(0, delta, 0)) end)
-            log("Vertical adjust by", delta)
+            log("Vertical adjusted by", delta)
         end
     else
-        log("Could not compute feet Y; skipping vertical adjust")
+        log("Feet Y couldn't be computed; skipping vertical alignment")
     end
 
-    -- parent into workspace BEFORE assigning character
+    -- parent into workspace BEFORE assignment
     newChar.Parent = workspace
-    newChar.Name = lp.Name
+    newChar.Name = lp.Name or "Player"
 
-    -- put animation IDs as attributes (LocalScript inside clone will read them)
-    newChar:SetAttribute("MorphIdle", IDLE_ID)
-    newChar:SetAttribute("MorphWalk", WALK_ID)
-
-    -- copy StarterCharacterScripts (local scripts) into clone
+    -- optionally copy StarterCharacterScripts (so Animate and other local controllers exist)
     copyStarterLocalScriptsToClone(newChar)
-
-    -- insert our LocalScript controller
-    insertLocalScriptToClone(newChar)
 
     -- transfer tools
     transferTools(oldChar, newChar)
 
-    -- assign as character (must be after parenting and local scripts placed)
+    -- assign as character (after parent and local scripts)
     local ok, err = pcall(function() lp.Character = newChar end)
     if not ok then
         warnlog("Failed to set lp.Character:", err)
@@ -215,18 +191,57 @@ local function doMorph()
         return
     end
 
-    -- set camera subject to humanoid for proper camera behavior
-    local hum = newChar:FindFirstChildOfClass("Humanoid")
-    if hum and workspace.CurrentCamera then
-        pcall(function() workspace.CurrentCamera.CameraSubject = hum end)
+    -- ensure humanoid and camera subject
+    local humanoid = newChar:FindFirstChildOfClass("Humanoid")
+    if humanoid and workspace.CurrentCamera then
+        pcall(function() workspace.CurrentCamera.CameraSubject = humanoid end)
     end
 
-    -- remove old char after short delay
-    task.delay(1.2, function()
-        if oldChar and oldChar.Parent then pcall(function() oldChar:Destroy() end) end
+    -- local: load & play animations in this injector (client)
+    local tracks = nil
+    if humanoid then
+        tracks = loadAndPlayAnimationsOn(humanoid, IDLE_ID, WALK_ID)
+    end
+
+    -- FP handling: hide body when camera is very close to head
+    local headPart = newChar:FindFirstChild("Head", true) or newChar:FindFirstChildWhichIsA("BasePart", true)
+    local FP_HIDE_DISTANCE = 0.6
+    local conn
+    conn = RunService.RenderStepped:Connect(function()
+        if not headPart or not workspace.CurrentCamera then return end
+        local d = (workspace.CurrentCamera.CFrame.Position - headPart.Position).Magnitude
+        if d < FP_HIDE_DISTANCE then
+            setLocalVisibility(newChar, false)
+        else
+            setLocalVisibility(newChar, true)
+        end
     end)
 
-    log("Morph complete ->", newChar:GetFullName())
+    -- cleanup old char after short delay to avoid dropping tools abruptly
+    task.delay(1.2, function()
+        if oldChar and oldChar.Parent then
+            pcall(function() oldChar:Destroy() end)
+        end
+    end)
+
+    log("Morph applied successfully. New character:", newChar:GetFullName())
+    -- expose revert in _G
+    _G.__morph_revert = function()
+        if conn then conn:Disconnect(); conn = nil end
+        if tracks then
+            if tracks.idle and tracks.idle.IsPlaying then pcall(function() tracks.idle:Stop() end) end
+            if tracks.walk and tracks.walk.IsPlaying then pcall(function() tracks.walk:Stop() end) end
+        end
+        pcall(function()
+            if lp.Character and lp.Character ~= newChar and lp.Character.Parent then lp.Character:Destroy() end
+        end)
+        -- try restore oldChar (best-effort)
+        if oldChar and not oldChar.Parent then
+            oldChar.Parent = workspace
+            lp.Character = oldChar
+        end
+        log("Morph reverted (best-effort).")
+    end
 end
 
 -- run
