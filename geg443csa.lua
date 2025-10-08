@@ -1,262 +1,159 @@
--- visual-morph-clean-fixed-v2.lua  (client / injector)
--- Фиксы: manual HIP_OFFSET, debug prints, improved FP hide.
-
-local MODEL_NAME = "Deer"
-local IDLE_ID    = "rbxassetid://138304500572165" -- check ID
-local WALK_ID    = "rbxassetid://78826693826761"
-local VISUAL_NAME = "LOCAL_VISUAL_DEER"
-local SMOOTH = 0.45
-local FP_HIDE_DISTANCE = 0.6
-local HIP_OFFSET = 3.0  -- !!! MANUAL TUNE: Начни с 2-4, тесть в игре. Большше = визуал выше (ноги на земле), реальный ниже относительно.
+-- morph-deer-inject.lua  (client / injector for private place)
+-- M = morph to Deer with anims, R = revert. Auto-morph on load.
+-- Features: Anims (idle/walk), FP shows original-ish hands (auto if rig match), tools interact (visible in TP fixed near char), chat over Deer head.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
 local lp = Players.LocalPlayer
 if not lp then warn("No LocalPlayer") return end
 
-local function findTemplate()
-    local t = workspace:FindFirstChild(MODEL_NAME)
-    if t and t:IsA("Model") then return t end
-    return nil
+local TEMPLATE = workspace:FindFirstChild("Deer")
+if not TEMPLATE then warn("Deer model not found in workspace") return end
+
+local IDLE_ID = "rbxassetid://138304500572165"  -- check in Studio if loads
+local WALK_ID = "rbxassetid://78826693826761"
+
+local AUTO_MORPH_ON_LOAD = true  -- set false if manual only
+local morphedData = {}  -- {UserId = {oldChar, newChar, idleTrack, walkTrack, animConn}}
+
+local function getRoot(model)
+    return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
 end
 
-local template = findTemplate()
-if not template then warn("Template model '"..MODEL_NAME.."' not found") return end
-
--- state
-local visual = nil
-local visualHum = nil
-local animator = nil
-local idleTrack, walkTrack = nil, nil
-local followConn = nil
-local toolConns = {}
-local spawnedToolVisuals = {}
-local cam = workspace.CurrentCamera
-local originalHipHeight = nil
-
--- helpers
-local function safeFindPart(model, names)
-    for _,n in ipairs(names) do
-        local p = model:FindFirstChild(n, true)
-        if p and p:IsA("BasePart") then return p end
+local function safeSetCamera(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum and workspace.CurrentCamera then
+        workspace.CurrentCamera.CameraSubject = hum
     end
-    return nil
 end
 
-local function setLocalVisibility(model, visible, excludeArms)
-    for _,v in ipairs(model:GetDescendants()) do
-        if v:IsA("BasePart") or v:IsA("Accessory") then  -- added Accessory for hair
-            local nameLower = v.Name:lower()
-            if excludeArms and (string.find(nameLower, "arm") or string.find(nameLower, "hand")) then
-                -- skip arms/hands
-            elseif excludeArms and (string.find(nameLower, "head") or string.find(nameLower, "torso") or string.find(nameLower, "leg") or string.find(nameLower, "hair")) then
-                pcall(function() v.LocalTransparencyModifier = 1 end)  -- force hide head/torso/legs/hair in FP
-            else
-                pcall(function() v.LocalTransparencyModifier = visible and 0 or 1 end)
-            end
+local function loadAnim(animator, id, looped, priority)
+    local anim = Instance.new("Animation")
+    anim.AnimationId = id
+    local track = pcall(function() return animator:LoadAnimation(anim) end)
+    if not track then warn("Failed load anim:", id) return nil end
+    track.Looped = looped
+    track.Priority = priority or Enum.AnimationPriority.Movement
+    return track
+end
+
+local function setupAnims(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then warn("No Humanoid in clone") return nil, nil end
+    local animator = Instance.new("Animator", hum)
+    local idle = loadAnim(animator, IDLE_ID, true)
+    local walk = loadAnim(animator, WALK_ID, true)
+    if idle then idle:Play() end  -- start idle
+
+    -- switch on speed
+    local conn = hum.Running:Connect(function(speed)
+        if speed > 0.5 then
+            if idle and idle.IsPlaying then idle:Stop(0.1) end
+            if walk and not walk.IsPlaying then walk:Play() end
+        else
+            if walk and walk.IsPlaying then walk:Stop(0.1) end
+            if idle and not idle.IsPlaying then idle:Play() end
         end
+    end)
+
+    return idle, walk, conn
+end
+
+local function morphPlayer(plr)
+    if morphedData[plr.UserId] then return end  -- already morphed
+
+    local oldChar = plr.Character or plr.CharacterAdded:Wait()
+    if not oldChar then warn("No old char") return end
+
+    local clone = TEMPLATE:Clone()
+    clone.Name = plr.Name
+
+    -- position
+    local oldRoot = getRoot(oldChar)
+    local newRoot = getRoot(clone)
+    if oldRoot and newRoot then
+        newRoot.CFrame = oldRoot.CFrame
     end
-end
-
-local function isFirstPerson()
-    if not cam then return false end
-    local char = lp.Character
-    if not char then return false end
-    local head = char:FindFirstChild("Head")
-    if not head then return false end
-    local dist = (cam.CFrame.Position - head.Position).Magnitude
-    return dist < FP_HIDE_DISTANCE
-end
-
-local function loadTrackFromId(animatorObj, id)
-    if not animatorObj or not id then return nil end
-    local a = Instance.new("Animation")
-    a.AnimationId = id
-    a.Parent = animatorObj
-    local ok, tr = pcall(function() return animatorObj:LoadAnimation(a) end)
-    if not ok or not tr then warn("LoadAnimation failed:", id, tr); a:Destroy(); return nil end
-    tr.Priority = Enum.AnimationPriority.Movement
-    return tr
-end
-
--- tool visual: clone whole tool
-local function createToolVisual(tool)
-    if not visual then return end
-    local visualTool = tool:Clone()
-    visualTool.Name = "VISUAL_"..(tool.Name or "Tool")
-    visualTool.Parent = visual
-    for _,p in ipairs(visualTool:GetDescendants()) do
-        if p:IsA("BasePart") then p.CanCollide = false end
-    end
-
-    local hand = safeFindPart(visual, {"RightHand","RightUpperArm","RightArm"})
-    if not hand then hand = visual.PrimaryPart end
-
-    local handle = visualTool:FindFirstChild("Handle") or visualTool:FindFirstChildWhichIsA("BasePart")
-    if not handle then return end
-
-    local attV = Instance.new("Attachment"); attV.Parent = handle
-    local attH = Instance.new("Attachment"); attH.Parent = hand
-
-    local ap = Instance.new("AlignPosition"); ap.Attachment0 = attV; ap.Attachment1 = attH
-    ap.Responsiveness = 200; ap.MaxForce = 1e5; ap.RigidityEnabled = true; ap.Parent = handle
-    local ao = Instance.new("AlignOrientation"); ao.Attachment0 = attV; ao.Attachment1 = attH
-    ao.Responsiveness = 200; ao.MaxTorque = 1e5; ao.RigidityEnabled = true; ao.Parent = handle
-
-    return visualTool, {ap=ap, ao=ao, attV=attV, attH=attH}
-end
-
-local function cleanupToolVisuals()
-    for k,v in pairs(spawnedToolVisuals) do
-        if v.instance then pcall(function() v.instance:Destroy() end) end
-    end
-    spawnedToolVisuals = {}
-    for k,c in pairs(toolConns) do if c then c:Disconnect() end end
-    toolConns = {}
-end
-
--- create visual
-local function createVisual()
-    if visual and visual.Parent then return visual end
-    local ok, clone = pcall(function() return template:Clone() end)
-    if not ok or not clone then warn("Clone failed:", clone) return nil end
-
-    clone.Name = VISUAL_NAME
-    for _,d in ipairs(clone:GetDescendants()) do
-        if d:IsA("Script") or d:IsA("ModuleScript") then pcall(function() d:Destroy() end) end
-        if d:IsA("Humanoid") then pcall(function() d:Destroy() end) end
-        if d:IsA("BasePart") then pcall(function() d.CanCollide = false; d.Anchored = false end) end
-    end
-
-    local prim = clone:FindFirstChild("HumanoidRootPart", true) or clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart", true)
-    if prim then clone.PrimaryPart = prim end
 
     clone.Parent = workspace
-    visual = clone
 
-    visualHum = Instance.new("Humanoid")
-    visualHum.Name = "VisualHumanoid"
-    visualHum.Parent = visual
-    animator = Instance.new("Animator"); animator.Parent = visualHum
+    -- setup anims before assign (engine auto-hipheight after)
+    local idle, walk, animConn = setupAnims(clone)
 
-    idleTrack = loadTrackFromId(animator, IDLE_ID)
-    walkTrack = loadTrackFromId(animator, WALK_ID)
-    if idleTrack then pcall(function() idleTrack.Looped = true; idleTrack:Play() end) end
-    if walkTrack then pcall(function() walkTrack.Looped = true end) end
+    -- assign char
+    pcall(function() plr.Character = clone end)
+    safeSetCamera(clone)
 
-    local char = lp.Character or lp.CharacterAdded:Wait()
-    local realHum = char:FindFirstChildOfClass("Humanoid")
-    if realHum then
-        originalHipHeight = realHum.HipHeight
-        pcall(function() realHum.HipHeight = realHum.HipHeight - HIP_OFFSET end)  -- !!! Изменил: опускаем реальный, чтобы камера ниже; визуал следует без shift
-        print("Debug: Set real HipHeight to", realHum.HipHeight, " (original:", originalHipHeight, ")")
-    end
-
-    setLocalVisibility(char, false)
-
-    -- tools
-    local function onToolEquipped(tool)
-        pcall(function() setLocalVisibility(tool, false) end)
-        local vt, info = createToolVisual(tool)
-        if vt then spawnedToolVisuals[tool] = {instance = vt, info = info} end
-    end
-    local function onToolUnequipped(tool)
-        local data = spawnedToolVisuals[tool]
-        if data then pcall(function() data.instance:Destroy() end) end
-        spawnedToolVisuals[tool] = nil
-        pcall(function() setLocalVisibility(tool, true) end)
-    end
-
-    local function bindToolEventsToContainer(container)
-        if not container then return end
-        for _,item in ipairs(container:GetChildren()) do
-            if item:IsA("Tool") then
-                toolConns[item] = item.Equipped:Connect(function() onToolEquipped(item) end)
-                toolConns[item .. "_uneq"] = item.Unequipped:Connect(function() onToolUnequipped(item) end)
-            end
+    -- transfer tools from old to new (backpack or equipped)
+    local backpack = plr:FindFirstChildOfClass("Backpack")
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") then tool.Parent = clone end
         end
-        container.ChildAdded:Connect(function(child)
-            if child:IsA("Tool") then
-                toolConns[child] = child.Equipped:Connect(function() onToolEquipped(child) end)
-                toolConns[child .. "_uneq"] = child.Unequipped:Connect(function() onToolUnequipped(child) end)
-            end
-        end)
+    end
+    for _, tool in ipairs(oldChar:GetChildren()) do
+        if tool:IsA("Tool") then tool.Parent = clone end
     end
 
-    bindToolEventsToContainer(lp:FindFirstChildOfClass("Backpack"))
-    if char then bindToolEventsToContainer(char) end
-    lp.CharacterAdded:Connect(function(newChar)
-        bindToolEventsToContainer(newChar)
-        local newHum = newChar:WaitForChild("Humanoid", 5)
-        if newHum then
-            pcall(function() newHum.HipHeight = newHum.HipHeight - HIP_OFFSET end)
-            print("Debug: Respawn HipHeight set to", newHum.HipHeight)
-        end
-        setLocalVisibility(newChar, false)
-    end)
+    -- store
+    morphedData[plr.UserId] = {oldChar = oldChar, newChar = clone, idleTrack = idle, walkTrack = walk, animConn = animConn}
 
-    -- follow
-    local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
-    if not hrp then warn("No HRP") return end
+    -- optional: if tools not in hands, fix position (e.g. attach to root + offset)
+    -- RunService.Heartbeat:Connect(function() -- if need fixed pos
+    --     for _, tool in ipairs(clone:GetChildren()) do
+    --         if tool:IsA("Tool") and tool.Handle then
+    --             tool.Handle.CFrame = newRoot.CFrame * CFrame.new(2, 0, 0)  -- example offset right
+    --         end
+    --     end
+    -- end)
 
-    if followConn then followConn:Disconnect() end
-    followConn = RunService.RenderStepped:Connect(function()
-        if not visual or not visual.PrimaryPart or not hrp then return end
-        local fp = isFirstPerson()
-        if fp then
-            setLocalVisibility(visual, false)
-            for _,data in pairs(spawnedToolVisuals) do if data.instance then setLocalVisibility(data.instance, false) end end
-            setLocalVisibility(char, true, true)  -- exclude arms, force hide others
-        else
-            setLocalVisibility(visual, true)
-            for _,data in pairs(spawnedToolVisuals) do if data.instance then setLocalVisibility(data.instance, true) end end
-            setLocalVisibility(char, false)
-        end
-        -- lerp without downward shift; since real lowered, visual follows directly
-        local target = hrp.CFrame
-        local cur = visual.PrimaryPart.CFrame
-        local new = cur:Lerp(target, SMOOTH)
-        visual:SetPrimaryPartCFrame(new)
-        print("Debug frame: Real HRP.Y =", hrp.Position.Y, " | Visual Prim.Y =", visual.PrimaryPart.Position.Y)  -- spam, but for test; remove later
-    end)
+    -- FP hack: if want original hands, clone old arms and attach (uncomment if rig mismatch)
+    -- local oldRightArm = oldChar:FindFirstChild("RightUpperArm")  -- assume R15
+    -- if oldRightArm then
+    --     local fpArm = oldRightArm:Clone()
+    --     fpArm.Parent = workspace.CurrentCamera  -- attach to cam
+    --     -- position via RenderStepped to follow
+    -- end  -- but this bags, better match rig
 
-    -- anim
-    if realHum and walkTrack then
-        realHum.Running:Connect(function(speed)
-            if speed > 0.5 then
-                if idleTrack then pcall(function() idleTrack:Stop(0.12) end) end
-                if walkTrack then pcall(function() walkTrack:Play() end) end
-            else
-                if walkTrack then pcall(function() walkTrack:Stop(0.12) end) end
-                if idleTrack then pcall(function() idleTrack:Play() end) end
-            end
-        end)
-    end
-
-    return visual
+    -- destroy old char after delay (avoid nil refs)
+    task.delay(1, function() if oldChar then oldChar:Destroy() end end)
 end
 
--- revert
-local function revertMorph()
-    if followConn then followConn:Disconnect(); followConn = nil end
-    cleanupToolVisuals()
-    if visual then pcall(function() visual:Destroy() end) end
-    visual = nil; animator = nil; idleTrack = nil; walkTrack = nil
-    local char = lp.Character
-    if char then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum and originalHipHeight then pcall(function() hum.HipHeight = originalHipHeight end) end
-        setLocalVisibility(char, true)
+local function revertPlayer(plr)
+    local data = morphedData[plr.UserId]
+    if not data then return end
+
+    if data.animConn then data.animConn:Disconnect() end
+    if data.idleTrack then data.idleTrack:Stop() end
+    if data.walkTrack then data.walkTrack:Stop() end
+
+    if data.oldChar and data.oldChar.Parent then
+        pcall(function() plr.Character = data.oldChar end)
+        safeSetCamera(data.oldChar)
+    else
+        plr:LoadCharacter()
     end
-    print("Morph reverted.")
+
+    if data.newChar then data.newChar:Destroy() end
+    morphedData[plr.UserId] = nil
 end
 
-local v = createVisual()
-if v then
-    print("Created:", v:GetFullName())
-    print("Revert: revertMorph()")
-else
-    warn("Failed")
+-- keys
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.M then morphPlayer(lp) end
+    if input.KeyCode == Enum.KeyCode.R then revertPlayer(lp) end
+end)
+
+-- reset on respawn
+lp.CharacterAdded:Connect(function() morphedData[lp.UserId] = nil end)
+
+-- auto
+if AUTO_MORPH_ON_LOAD then
+    task.wait(0.5)  -- wait load
+    morphPlayer(lp)
 end
 
-_G.revertMorph = revertMorph
+print("[Deer Morph] Ready. M = morph, R = revert.")
