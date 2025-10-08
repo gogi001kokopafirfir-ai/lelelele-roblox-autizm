@@ -6,7 +6,7 @@ local IDLE_ID    = "rbxassetid://138304500572165"
 local WALK_ID    = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_VISUAL_DEER"
 local SMOOTH = 0.45 -- 0..1, скорость следования
-local extraVerticalOffset = 0.02 -- мелкая корректировка вверх (если ноги всё ещё чуть врезаются)
+local extraVerticalOffset = -0.03 -- мелкая корректировка вверх (если ноги всё ещё чуть врезаются)
 local FP_HIDE_DISTANCE = 0.6 -- порог для первого лица
 
 local Players = game:GetService("Players")
