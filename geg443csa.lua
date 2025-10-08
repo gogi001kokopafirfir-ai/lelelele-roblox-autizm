@@ -1,6 +1,5 @@
--- morph-deer-inject.lua  (client / injector for private place)
--- M = morph to Deer with anims, R = revert. Auto-morph on load.
--- Features: Anims (idle/walk), FP shows original-ish hands (auto if rig match), tools interact (visible in TP fixed near char), chat over Deer head.
+-- morph-deer-inject-fixed.lua  (client / injector)
+-- Fixes: proper pcall in loadAnim, checks for hum/anim load.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -10,13 +9,13 @@ local lp = Players.LocalPlayer
 if not lp then warn("No LocalPlayer") return end
 
 local TEMPLATE = workspace:FindFirstChild("Deer")
-if not TEMPLATE then warn("Deer model not found in workspace") return end
+if not TEMPLATE then warn("Deer not found") return end
 
-local IDLE_ID = "rbxassetid://138304500572165"  -- check in Studio if loads
+local IDLE_ID = "rbxassetid://138304500572165"  -- тесть в Studio, если fail — invalid ID
 local WALK_ID = "rbxassetid://78826693826761"
 
-local AUTO_MORPH_ON_LOAD = true  -- set false if manual only
-local morphedData = {}  -- {UserId = {oldChar, newChar, idleTrack, walkTrack, animConn}}
+local AUTO_MORPH_ON_LOAD = true
+local morphedData = {}
 
 local function getRoot(model)
     return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
@@ -32,29 +31,33 @@ end
 local function loadAnim(animator, id, looped, priority)
     local anim = Instance.new("Animation")
     anim.AnimationId = id
-    local track = pcall(function() return animator:LoadAnimation(anim) end)
-    if not track then warn("Failed load anim:", id) return nil end
-    track.Looped = looped
+    local success, track = pcall(animator.LoadAnimation, animator, anim)  -- fixed pcall
+    if not success then
+        warn("Failed load anim " .. id .. ": " .. tostring(track))  -- track = error msg
+        anim:Destroy()
+        return nil
+    end
+    track.Looped = looped or false
     track.Priority = priority or Enum.AnimationPriority.Movement
     return track
 end
 
 local function setupAnims(char)
     local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum then warn("No Humanoid in clone") return nil, nil end
-    local animator = Instance.new("Animator", hum)
+    if not hum then warn("No Humanoid in Deer clone") return nil, nil, nil end
+    local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
     local idle = loadAnim(animator, IDLE_ID, true)
     local walk = loadAnim(animator, WALK_ID, true)
-    if idle then idle:Play() end  -- start idle
+    if not idle or not walk then warn("Anims failed to load — check IDs") return nil, nil, nil end
+    idle:Play()  -- start idle
 
-    -- switch on speed
     local conn = hum.Running:Connect(function(speed)
         if speed > 0.5 then
-            if idle and idle.IsPlaying then idle:Stop(0.1) end
-            if walk and not walk.IsPlaying then walk:Play() end
+            if idle.IsPlaying then idle:Stop(0.1) end
+            if not walk.IsPlaying then walk:Play() end
         else
-            if walk and walk.IsPlaying then walk:Stop(0.1) end
-            if idle and not idle.IsPlaying then idle:Play() end
+            if walk.IsPlaying then walk:Stop(0.1) end
+            if not idle.IsPlaying then idle:Play() end
         end
     end)
 
@@ -62,7 +65,7 @@ local function setupAnims(char)
 end
 
 local function morphPlayer(plr)
-    if morphedData[plr.UserId] then return end  -- already morphed
+    if morphedData[plr.UserId] then return end
 
     local oldChar = plr.Character or plr.CharacterAdded:Wait()
     if not oldChar then warn("No old char") return end
@@ -70,7 +73,6 @@ local function morphPlayer(plr)
     local clone = TEMPLATE:Clone()
     clone.Name = plr.Name
 
-    -- position
     local oldRoot = getRoot(oldChar)
     local newRoot = getRoot(clone)
     if oldRoot and newRoot then
@@ -79,14 +81,14 @@ local function morphPlayer(plr)
 
     clone.Parent = workspace
 
-    -- setup anims before assign (engine auto-hipheight after)
     local idle, walk, animConn = setupAnims(clone)
+    if not idle then warn("Setup anims failed — morph aborted") clone:Destroy() return end
 
-    -- assign char
-    pcall(function() plr.Character = clone end)
+    local success = pcall(function() plr.Character = clone end)
+    if not success then warn("Failed to set plr.Character — injector rights?") clone:Destroy() return end
     safeSetCamera(clone)
 
-    -- transfer tools from old to new (backpack or equipped)
+    -- tools transfer
     local backpack = plr:FindFirstChildOfClass("Backpack")
     if backpack then
         for _, tool in ipairs(backpack:GetChildren()) do
@@ -97,27 +99,8 @@ local function morphPlayer(plr)
         if tool:IsA("Tool") then tool.Parent = clone end
     end
 
-    -- store
     morphedData[plr.UserId] = {oldChar = oldChar, newChar = clone, idleTrack = idle, walkTrack = walk, animConn = animConn}
 
-    -- optional: if tools not in hands, fix position (e.g. attach to root + offset)
-    -- RunService.Heartbeat:Connect(function() -- if need fixed pos
-    --     for _, tool in ipairs(clone:GetChildren()) do
-    --         if tool:IsA("Tool") and tool.Handle then
-    --             tool.Handle.CFrame = newRoot.CFrame * CFrame.new(2, 0, 0)  -- example offset right
-    --         end
-    --     end
-    -- end)
-
-    -- FP hack: if want original hands, clone old arms and attach (uncomment if rig mismatch)
-    -- local oldRightArm = oldChar:FindFirstChild("RightUpperArm")  -- assume R15
-    -- if oldRightArm then
-    --     local fpArm = oldRightArm:Clone()
-    --     fpArm.Parent = workspace.CurrentCamera  -- attach to cam
-    --     -- position via RenderStepped to follow
-    -- end  -- but this bags, better match rig
-
-    -- destroy old char after delay (avoid nil refs)
     task.delay(1, function() if oldChar then oldChar:Destroy() end end)
 end
 
@@ -140,20 +123,17 @@ local function revertPlayer(plr)
     morphedData[plr.UserId] = nil
 end
 
--- keys
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
     if input.KeyCode == Enum.KeyCode.M then morphPlayer(lp) end
     if input.KeyCode == Enum.KeyCode.R then revertPlayer(lp) end
 end)
 
--- reset on respawn
 lp.CharacterAdded:Connect(function() morphedData[lp.UserId] = nil end)
 
--- auto
 if AUTO_MORPH_ON_LOAD then
-    task.wait(0.5)  -- wait load
+    task.wait(0.5)
     morphPlayer(lp)
 end
 
-print("[Deer Morph] Ready. M = morph, R = revert.")
+print("[Deer Morph Fixed] Ready. M = morph, R = revert.")
