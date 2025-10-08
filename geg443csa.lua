@@ -1,8 +1,7 @@
--- morph-deer-inject-fixed.lua  (client / injector)
--- Fixes: proper pcall in loadAnim, checks for hum/anim load.
+-- morph-deer-inject-fixed-v2.lua  (client / injector)
+-- Fixes: Tools attach (fixed near Deer), HipHeight manual (pass doors with clip), anim checks.
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 
 local lp = Players.LocalPlayer
@@ -11,11 +10,12 @@ if not lp then warn("No LocalPlayer") return end
 local TEMPLATE = workspace:FindFirstChild("Deer")
 if not TEMPLATE then warn("Deer not found") return end
 
-local IDLE_ID = "rbxassetid://138304500572165"  -- тесть в Studio, если fail — invalid ID
+local IDLE_ID = "rbxassetid://138304500572165"  -- тесть ID в Studio
 local WALK_ID = "rbxassetid://78826693826761"
 
 local AUTO_MORPH_ON_LOAD = true
 local morphedData = {}
+local originalHipHeight = nil  -- store for revert
 
 local function getRoot(model)
     return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
@@ -31,9 +31,9 @@ end
 local function loadAnim(animator, id, looped, priority)
     local anim = Instance.new("Animation")
     anim.AnimationId = id
-    local success, track = pcall(animator.LoadAnimation, animator, anim)  -- fixed pcall
+    local success, track = pcall(animator.LoadAnimation, animator, anim)
     if not success then
-        warn("Failed load anim " .. id .. ": " .. tostring(track))  -- track = error msg
+        warn("Failed load anim " .. id .. ": " .. tostring(track))
         anim:Destroy()
         return nil
     end
@@ -44,12 +44,12 @@ end
 
 local function setupAnims(char)
     local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum then warn("No Humanoid in Deer clone") return nil, nil, nil end
+    if not hum then warn("No Humanoid") return nil, nil, nil end
     local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
     local idle = loadAnim(animator, IDLE_ID, true)
     local walk = loadAnim(animator, WALK_ID, true)
-    if not idle or not walk then warn("Anims failed to load — check IDs") return nil, nil, nil end
-    idle:Play()  -- start idle
+    if not idle or not walk then return nil, nil, nil end
+    idle:Play()
 
     local conn = hum.Running:Connect(function(speed)
         if speed > 0.5 then
@@ -64,11 +64,32 @@ local function setupAnims(char)
     return idle, walk, conn
 end
 
+local function attachToolToChar(tool, char)
+    local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+    if not handle then warn("No handle in tool: " .. tool.Name) return end
+
+    -- disable physics
+    handle.CanCollide = false
+    handle.Anchored = true  -- prevent fall
+
+    local hand = char:FindFirstChild("RightHand", true) or char:FindFirstChild("RightArm", true)
+    if not hand then hand = getRoot(char) warn("No hand — fallback to root") end
+
+    -- weld for fixed pos
+    local weld = Instance.new("Weld")
+    weld.Part0 = handle
+    weld.Part1 = hand
+    weld.C0 = CFrame.new(1, 0, 0)  -- offset: adjust (x,y,z) for "nearby" pos, e.g. (2,1,-1) for right side
+    weld.Parent = handle
+end
+
 local function morphPlayer(plr)
     if morphedData[plr.UserId] then return end
 
     local oldChar = plr.Character or plr.CharacterAdded:Wait()
     if not oldChar then warn("No old char") return end
+    local oldHum = oldChar:FindFirstChildOfClass("Humanoid")
+    if oldHum then originalHipHeight = oldHum.HipHeight end  -- store original
 
     local clone = TEMPLATE:Clone()
     clone.Name = plr.Name
@@ -82,21 +103,41 @@ local function morphPlayer(plr)
     clone.Parent = workspace
 
     local idle, walk, animConn = setupAnims(clone)
-    if not idle then warn("Setup anims failed — morph aborted") clone:Destroy() return end
+    if not idle then warn("Anims fail — abort") clone:Destroy() return end
 
     local success = pcall(function() plr.Character = clone end)
-    if not success then warn("Failed to set plr.Character — injector rights?") clone:Destroy() return end
+    if not success then warn("Set char fail") clone:Destroy() return end
     safeSetCamera(clone)
 
-    -- tools transfer
+    -- fix hipheight for doors (set to original — clip ok)
+    local newHum = clone:FindFirstChildOfClass("Humanoid")
+    if newHum and originalHipHeight then
+        newHum.HipHeight = originalHipHeight  -- lower to pass doors
+        print("Set HipHeight to original:", originalHipHeight)
+    end
+
+    -- tools transfer + attach
     local backpack = plr:FindFirstChildOfClass("Backpack")
     if backpack then
         for _, tool in ipairs(backpack:GetChildren()) do
-            if tool:IsA("Tool") then tool.Parent = clone end
+            if tool:IsA("Tool") then
+                tool.Parent = clone
+                attachToolToChar(tool, clone)
+            end
         end
     end
     for _, tool in ipairs(oldChar:GetChildren()) do
-        if tool:IsA("Tool") then tool.Parent = clone end
+        if tool:IsA("Tool") then
+            tool.Parent = clone
+            attachToolToChar(tool, clone)
+        end
+    end
+
+    -- monitor new tools (backpack/childadded)
+    if backpack then
+        backpack.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") then attachToolToChar(child, clone) end
+        end)
     end
 
     morphedData[plr.UserId] = {oldChar = oldChar, newChar = clone, idleTrack = idle, walkTrack = walk, animConn = animConn}
@@ -136,4 +177,4 @@ if AUTO_MORPH_ON_LOAD then
     morphPlayer(lp)
 end
 
-print("[Deer Morph Fixed] Ready. M = morph, R = revert.")
+print("[Deer Morph V2] Ready. M = morph, R = revert.")
