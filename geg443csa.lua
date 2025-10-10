@@ -1,5 +1,5 @@
 -- visual-deer-morph-fixed4.lua  (client / injector)
--- Fixes: Hide Decal/GUI on real (for emotions), camera shift up, clone chat bubble to visual Head.
+-- Fixes: Shift cam only in TP, StudsOffset for bubble lift, hide Decal/GUI on real (for emotions).
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -190,9 +190,11 @@ local function createVisual()
         local cur = visual.PrimaryPart.CFrame
         visual:SetPrimaryPartCFrame(cur:Lerp(target, SMOOTH))
         
-        -- camera shift up (local hack)
-        local currentCFrame = cam.CFrame
-        cam.CFrame = currentCFrame * CFrame.new(0, HIP_OFFSET, 0)  -- shift Y up for TP view
+        -- camera shift up only in TP
+        if not fp then
+            local currentCFrame = cam.CFrame
+            cam.CFrame = currentCFrame * CFrame.new(0, HIP_OFFSET, 0)  -- shift Y up for TP view
+        end
 
         -- clone chat bubble
         local realHead = char:FindFirstChild("Head")
@@ -203,6 +205,7 @@ local function createVisual()
                 chatClone = realBubble:Clone()
                 chatClone.Parent = visualHead
                 chatClone.Adornee = visualHead
+                chatClone.StudsOffset = Vector3.new(0, HIP_OFFSET + 2, 0)  -- lift bubble above head; tune +1-3 if low
                 realBubble.Enabled = false  -- hide real
             end
         end
