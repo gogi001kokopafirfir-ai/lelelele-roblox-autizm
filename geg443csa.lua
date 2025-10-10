@@ -1,5 +1,5 @@
 -- visual-deer-morph-fixed4.lua  (client / injector)
--- Fixes: Shift cam only in TP, StudsOffset for bubble lift, hide Decal/GUI on real (for emotions).
+-- Fixes: Decal (face) hide in visibility, chat bubble offset, auto OFFSET with adjust, no negative Hip.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,7 +12,7 @@ local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
 local SMOOTH = 1  -- max smooth, no jitter
 local FP_HIDE_DISTANCE = 0.6
-local HIP_OFFSET = 5.0  -- your tune; adjust for ground
+local HIP_OFFSET = 5.0  -- manual default; tune 4-6 if auto high
 
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
 if not template then warn("Deer not found") return end
@@ -26,7 +26,7 @@ local toolVisuals = {}
 local toolConns = {}
 local cam = workspace.CurrentCamera
 local originalHip = nil
-local chatClone = nil  -- for bubble
+local originalChatOffset = 0  -- for revert
 
 local function safeFindPart(model, names)
     for _, n in ipairs(names) do
@@ -47,10 +47,8 @@ local function setLocalVisibility(model, visible, excludeArms)
             else
                 pcall(function() v.LocalTransparencyModifier = visible and 0 or 1 end)
             end
-        elseif v:IsA("Decal") then  -- fix emotions/face
+        elseif v:IsA("Decal") then  -- added for face/emotion decal
             pcall(function() v.Transparency = visible and 0 or 1 end)
-        elseif v:IsA("BillboardGui") or v:IsA("SurfaceGui") then  -- hide other GUIs
-            pcall(function() v.Enabled = visible end)
         end
     end
 end
@@ -124,7 +122,7 @@ local function createVisual()
     end
     setLocalVisibility(char, false)
 
-    -- auto offset (comment if manual only; subtract for overheight)
+    -- auto offset (comment if manual only)
     local realHeight = char:GetExtentsSize().Y
     local visualHeight = visual:GetExtentsSize().Y
     HIP_OFFSET = (visualHeight - realHeight) / 2 - 3  -- subtract 3 for horns/extra; tune -1 to -5 if still high
@@ -135,6 +133,14 @@ local function createVisual()
     local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
     if head then pcall(function() head.CanCollide = false end) end
     if torso then pcall(function() torso.CanCollide = false end) end
+
+    -- chat bubble offset
+    local chatConfig = game.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
+    if chatConfig then
+        originalChatOffset = chatConfig.VerticalStudsOffset
+        chatConfig.VerticalStudsOffset = HIP_OFFSET + 1  -- tune +1 for above Deer head
+        print("Chat offset set to", chatConfig.VerticalStudsOffset)
+    end
 
     -- tools
     local function onEquip(tool)
@@ -189,26 +195,6 @@ local function createVisual()
         local target = hrp.CFrame * CFrame.new(0, HIP_OFFSET, 0)  -- up visual
         local cur = visual.PrimaryPart.CFrame
         visual:SetPrimaryPartCFrame(cur:Lerp(target, SMOOTH))
-        
-        -- camera shift up only in TP
-        if not fp then
-            local currentCFrame = cam.CFrame
-            cam.CFrame = currentCFrame * CFrame.new(0, HIP_OFFSET, 0)  -- shift Y up for TP view
-        end
-
-        -- clone chat bubble
-        local realHead = char:FindFirstChild("Head")
-        local visualHead = visual:FindFirstChild("Head")
-        if realHead and visualHead then
-            local realBubble = realHead:FindFirstChildOfClass("BillboardGui")
-            if realBubble and not chatClone then
-                chatClone = realBubble:Clone()
-                chatClone.Parent = visualHead
-                chatClone.Adornee = visualHead
-                chatClone.StudsOffset = Vector3.new(0, HIP_OFFSET + 2, 0)  -- lift bubble above head; tune +1-3 if low
-                realBubble.Enabled = false  -- hide real
-            end
-        end
     end)
 
     -- anim
@@ -229,16 +215,15 @@ local function revert()
     if followConn then followConn:Disconnect() end
     cleanupTools()
     if visual then visual:Destroy() end
-    if chatClone then chatClone:Destroy() end
-    visual = nil; animator = nil; idleTrack = nil; walkTrack = nil; chatClone = nil
+    visual = nil; animator = nil; idleTrack = nil; walkTrack = nil
     local char = lp.Character
     if char then
         local hum = char:FindFirstChildOfClass("Humanoid")
         if hum and originalHip then hum.HipHeight = originalHip end
         setLocalVisibility(char, true)
-        local realBubble = char.Head:FindFirstChildOfClass("BillboardGui")
-        if realBubble then realBubble.Enabled = true end
     end
+    local chatConfig = game.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
+    if chatConfig then chatConfig.VerticalStudsOffset = originalChatOffset end
     print("Reverted")
 end
 
