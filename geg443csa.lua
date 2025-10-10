@@ -14,7 +14,7 @@ local IDLE_ID = "rbxassetid://138304500572165"  -- тесть ID в Studio
 local WALK_ID = "rbxassetid://78826693826761"
 
 local AUTO_MORPH_ON_LOAD = true
-local FIXED_HIP = 2.0  -- manual tune: original R15 ~2.0; уменьши, если всё равно высоко/не проходит
+local FIXED_HIP = 1.0  -- manual tune: original R15 ~2.0; уменьши, если всё равно высоко/не проходит
 local morphedData = {}
 
 local function getRoot(model)
