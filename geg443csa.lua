@@ -1,5 +1,5 @@
--- visual-deer-morph-fixed.lua  (client / injector)
--- Fixes: Visibility only on BasePart, smoother SMOOTH, debug prints, Hip low for doors.
+-- visual-deer-morph-fixed2.lua  (client / injector)
+-- Fixes: No negative Hip (no sunk for all), CanCollide=false on real head/torso for door clip, SMOOTH=1 no jitter.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -10,9 +10,9 @@ local TEMPLATE_NAME = "Deer"
 local IDLE_ID = "rbxassetid://138304500572165"
 local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
-local SMOOTH = 0.8  -- increased for less jitter
+local SMOOTH = 1  -- max smooth, no jitter
 local FP_HIDE_DISTANCE = 0.6
-local HIP_OFFSET = 1.5  -- start low, tune up if visual in ground (print diffs in F9)
+local HIP_OFFSET = 1.5  -- tune: (deer height - real height)/2 from Dex
 
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
 if not template then warn("Deer not found") return end
@@ -37,12 +37,12 @@ end
 
 local function setLocalVisibility(model, visible, excludeArms)
     for _, v in ipairs(model:GetDescendants()) do
-        if v:IsA("BasePart") then  -- fixed: only BasePart
+        if v:IsA("BasePart") then
             local name = v.Name:lower()
             if excludeArms and (name:find("arm") or name:find("hand")) then
-                -- skip arms
+                -- skip
             elseif excludeArms and (name:find("head") or name:find("torso") or name:find("leg") or name:find("hair")) then
-                pcall(function() v.LocalTransparencyModifier = 1 end)  -- hide body in FP
+                pcall(function() v.LocalTransparencyModifier = 1 end)
             else
                 pcall(function() v.LocalTransparencyModifier = visible and 0 or 1 end)
             end
@@ -116,10 +116,15 @@ local function createVisual()
     local realHum = char:FindFirstChildOfClass("Humanoid")
     if realHum then
         originalHip = realHum.HipHeight
-        realHum.HipHeight = originalHip - HIP_OFFSET  -- low real for doors
-        print("Debug: Real HipHeight set to", realHum.HipHeight)
+        -- no negative, keep original
     end
     setLocalVisibility(char, false)
+
+    -- hack for doors: no collide on real head/torso (local, may help clip)
+    local head = char:FindFirstChild("Head")
+    local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+    if head then pcall(function() head.CanCollide = false end) end
+    if torso then pcall(function() torso.CanCollide = false end) end
 
     -- tools
     local function onEquip(tool)
@@ -149,8 +154,10 @@ local function createVisual()
     bindTools(char)
     lp.CharacterAdded:Connect(function(newChar)
         bindTools(newChar)
-        local newHum = newChar:FindFirstChildOfClass("Humanoid")
-        if newHum then newHum.HipHeight = originalHip - HIP_OFFSET end
+        local head = newChar:FindFirstChild("Head")
+        local torso = newChar:FindFirstChild("UpperTorso") or newChar:FindFirstChild("Torso")
+        if head then pcall(function() head.CanCollide = false end) end
+        if torso then pcall(function() torso.CanCollide = false end) end
         setLocalVisibility(newChar, false)
     end)
 
@@ -172,7 +179,6 @@ local function createVisual()
         local target = hrp.CFrame * CFrame.new(0, HIP_OFFSET, 0)  -- up visual
         local cur = visual.PrimaryPart.CFrame
         visual:SetPrimaryPartCFrame(cur:Lerp(target, SMOOTH))
-        print("Debug: Real HRP.Y = ", hrp.Position.Y, " Visual Prim.Y = ", visual.PrimaryPart.Position.Y)  -- tune OFFSET
     end)
 
     -- anim
