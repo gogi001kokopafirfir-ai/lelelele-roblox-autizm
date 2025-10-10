@@ -1,4 +1,4 @@
--- visual-deer-morph-fixed6.lua  (client / injector) — safer version
+-- visual-deer-morph-fixed7.lua  (client / injector) — use AnimationController to avoid Humanoid physics conflict
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
@@ -10,7 +10,7 @@ local TEMPLATE_NAME = "Deer"
 local IDLE_ID = "rbxassetid://138304500572165"
 local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
-local LERP_ALPHA = 0.45        -- 0..1, 1 = instant, 0.45 = smooth
+local LERP_ALPHA = 0.45        -- 0..1, 1 = instant
 local FP_HIDE_DISTANCE = 0.6
 local HIP_MANUAL_OFFSET = nil  -- set number to force, otherwise auto-calc
 
@@ -18,21 +18,14 @@ local HIP_MANUAL_OFFSET = nil  -- set number to force, otherwise auto-calc
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
 if not template then warn("Deer template not found in workspace ("..tostring(TEMPLATE_NAME)..")") return end
 
-local visual, visualHum, animator, idleTrack, walkTrack
+local visual, animController, animator, idleTrack, walkTrack
 local followConn
 local connections = {}        -- list of all connections to cleanup
 local toolConns = {}         -- tool -> { equip = conn, unequip = conn }
 local childAddedConns = {}   -- container -> conn
-local original = {
-    hipHeight = nil,
-    chatOffset = nil,
-    headCanCollide = {},
-    torsoCanCollide = {},
-}
 
 local cam = workspace.CurrentCamera
 
--- safe helpers
 local function addConn(conn)
     if conn then table.insert(connections, conn) end
 end
@@ -43,22 +36,19 @@ local function disconnectAll()
     connections = {}
 end
 
-local function safeFindPart(model, names)
-    for _, n in ipairs(names) do
-        local p = model:FindFirstChild(n, true)
-        if p and p:IsA("BasePart") then return p end
-    end
-    return nil
-end
-
--- only change LocalTransparencyModifier and do NOT change Decal.Transparency or CanCollide on server-owned objects
 local function setLocalVisibility(model, visible)
     if not model then return end
     for _, v in ipairs(model:GetDescendants()) do
         if v:IsA("BasePart") then
-            pcall(function() v.LocalTransparencyModifier = visible and 0 or 1 end)
+            pcall(function()
+                v.LocalTransparencyModifier = visible and 0 or 1
+                v.CanCollide = false  -- keep visual parts non-collidable
+                -- make visual parts massless to reduce physics jitter
+                if v:IsA("BasePart") and v.Massless ~= nil then
+                    v.Massless = true
+                end
+            end)
         end
-        -- DO NOT change Decal.Transparency on server-owned char (it replicates)
     end
 end
 
@@ -69,7 +59,6 @@ local function isFirstPerson()
     return (cam.CFrame.Position - head.Position).Magnitude < FP_HIDE_DISTANCE
 end
 
--- load animation safely; parent Animation under visual to avoid GC
 local function loadTrack(animatorObj, id, looped)
     if not animatorObj or not id then return nil end
     local anim = Instance.new("Animation")
@@ -87,7 +76,6 @@ local function loadTrack(animatorObj, id, looped)
     return track
 end
 
--- clean up tool listeners
 local function cleanupTools()
     for tool, tbl in pairs(toolConns) do
         if tbl.equip then pcall(function() tbl.equip:Disconnect() end) end
@@ -102,12 +90,10 @@ end
 
 local function bindTools(container)
     if not container then return end
-    -- bind existing tools
     for _, t in ipairs(container:GetChildren()) do
         if t:IsA("Tool") and not toolConns[t] then
             toolConns[t] = {}
             toolConns[t].equip = t.Equipped:Connect(function()
-                -- hide tool visuals locally (handle parts)
                 setLocalVisibility(t, false)
             end)
             toolConns[t].unequip = t.Unequipped:Connect(function()
@@ -116,81 +102,77 @@ local function bindTools(container)
             addConn(toolConns[t].equip); addConn(toolConns[t].unequip)
         end
     end
-    -- watch for future tools
     if not childAddedConns[container] then
         childAddedConns[container] = container.ChildAdded:Connect(function(child)
-            if child:IsA("Tool") then
-                if not toolConns[child] then
-                    toolConns[child] = {}
-                    toolConns[child].equip = child.Equipped:Connect(function()
-                        setLocalVisibility(child, false)
-                    end)
-                    toolConns[child].unequip = child.Unequipped:Connect(function()
-                        setLocalVisibility(child, true)
-                    end)
-                    addConn(toolConns[child].equip); addConn(toolConns[child].unequip)
-                end
+            if child:IsA("Tool") and not toolConns[child] then
+                toolConns[child] = {}
+                toolConns[child].equip = child.Equipped:Connect(function() setLocalVisibility(child, false) end)
+                toolConns[child].unequip = child.Unequipped:Connect(function() setLocalVisibility(child, true) end)
+                addConn(toolConns[child].equip); addConn(toolConns[child].unequip)
             end
         end)
         addConn(childAddedConns[container])
     end
 end
 
--- create visual
 local function createVisual()
     if visual then return end
 
-    -- clone template (client-only)
     local ok, clone = pcall(function() return template:Clone() end)
     if not ok or not clone then warn("[visual] clone failed:", clone) return end
     clone.Name = VISUAL_NAME
 
-    -- sanitize clone: remove Scripts/ModuleScripts/Humanoid to avoid side effects (only in clone)
+    -- sanitize clone: remove Scripts/ModuleScripts and Humanoid (only in clone)
     for _, d in ipairs(clone:GetDescendants()) do
         if d:IsA("Script") or d:IsA("ModuleScript") or d:IsA("Humanoid") then
             pcall(function() d:Destroy() end)
         end
         if d:IsA("BasePart") then
-            pcall(function() d.CanCollide = false; d.Anchored = false end)
+            pcall(function()
+                d.CanCollide = false
+                d.Anchored = false
+                if d.Massless ~= nil then d.Massless = true end
+            end)
         end
     end
 
-    -- set primary
     local prim = clone:FindFirstChild("HumanoidRootPart") or clone:FindFirstChildWhichIsA("BasePart", true)
     if prim then clone.PrimaryPart = prim end
 
     clone.Parent = workspace
     visual = clone
 
-    -- animator
-    visualHum = Instance.new("Humanoid")
-    visualHum.Name = "LocalVisualHumanoid"
-    visualHum.Parent = visual
+    -- IMPORTANT: use AnimationController (no Humanoid) to avoid physics control conflicts
+    animController = Instance.new("AnimationController")
+    animController.Name = "LocalVisualAnimController"
+    animController.Parent = visual
     animator = Instance.new("Animator")
-    animator.Parent = visualHum
+    animator.Parent = animController
 
     idleTrack = loadTrack(animator, IDLE_ID, true)
     walkTrack = loadTrack(animator, WALK_ID, true)
     if idleTrack then pcall(function() idleTrack:Play() end) end
 
-    -- hide real character visually (local only)
     local char = lp.Character or lp.CharacterAdded:Wait()
     setLocalVisibility(char, false)
 
-    -- compute hip offset (auto or manual)
-    local realHeight = 0; local visualHeight = 0
-    pcall(function() realHeight = char:GetExtentsSize().Y end)
-    pcall(function() visualHeight = visual:GetExtentsSize().Y end)
-    local HIP_OFFSET = HIP_MANUAL_OFFSET or ((visualHeight - realHeight) / 2 - 3)
-    if not HIP_OFFSET or type(HIP_OFFSET) ~= "number" or math.abs(HIP_OFFSET) > 50 then
-        HIP_OFFSET = 5.0
+    -- compute hip offset auto or manual
+    local successReal, realHeight = pcall(function() return char:GetExtentsSize().Y end)
+    local successVisual, visualHeight = pcall(function() return visual:GetExtentsSize().Y end)
+    local HIP_OFFSET = HIP_MANUAL_OFFSET
+    if not HIP_OFFSET then
+        if successReal and successVisual then
+            HIP_OFFSET = (visualHeight - realHeight) / 2 - 3
+        else
+            HIP_OFFSET = 5.0
+        end
     end
-    print("[visual] HIP_OFFSET=", HIP_OFFSET)
+    if type(HIP_OFFSET) ~= "number" or math.abs(HIP_OFFSET) > 50 then HIP_OFFSET = 5.0 end
+    print("[visual] HIP_OFFSET =", HIP_OFFSET)
 
-    -- bind tools in backpack and char
+    -- bind tools
     pcall(function() bindTools(lp:FindFirstChildOfClass("Backpack")) end)
     pcall(function() bindTools(char) end)
-    -- on CharacterAdded, rebind
     addConn(lp.CharacterAdded:Connect(function(newChar)
         pcall(function() bindTools(newChar) end)
         pcall(function() setLocalVisibility(newChar, false) end)
@@ -204,21 +186,19 @@ local function createVisual()
         if not visual or not visual.PrimaryPart or not hrp then return end
         local fp = isFirstPerson()
         if fp then
-            -- In FP: hide visual and also hide real char (local)
             setLocalVisibility(visual, false)
             setLocalVisibility(char, false)
         else
             setLocalVisibility(visual, true)
             setLocalVisibility(char, false)
         end
-        -- position visual relative to hrp
         local target = hrp.CFrame * CFrame.new(0, HIP_OFFSET, 0)
         local cur = visual.PrimaryPart.CFrame
         visual:SetPrimaryPartCFrame(cur:Lerp(target, math.clamp(LERP_ALPHA, 0, 1)))
     end)
     addConn(followConn)
 
-    -- connect running -> anim switch (store connection)
+    -- link real humanoid Running -> switch anims
     local realHum = char:FindFirstChildOfClass("Humanoid")
     if realHum and walkTrack then
         local runC = realHum.Running:Connect(function(speed)
@@ -236,7 +216,6 @@ local function createVisual()
     print("[visual] created. Call revertVisual() to cleanup.")
 end
 
--- revert / cleanup
 local function revertVisual()
     -- disconnect everything
     disconnectAll()
@@ -245,14 +224,11 @@ local function revertVisual()
     if visual and visual.Parent then
         pcall(function() visual:Destroy() end)
     end
-    visual, visualHum, animator, idleTrack, walkTrack = nil, nil, nil, nil, nil
+    visual, animController, animator, idleTrack, walkTrack = nil, nil, nil, nil, nil
 
-    -- restore visibility of real char
+    -- restore local visibility for real char
     local char = lp.Character
-    if char then
-        pcall(function() setLocalVisibility(char, true) end)
-        -- restore other properties if you changed any (none changed now)
-    end
+    if char then pcall(function() setLocalVisibility(char, true) end) end
 
     print("[visual] reverted.")
 end
