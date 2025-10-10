@@ -1,5 +1,5 @@
--- visual-deer-morph-fixed8.lua  (client / injector)
--- Fix: align visual by lowest Y (feet) then compute HIP_OFFSET robustly.
+-- visual-deer-morph-fixed9.lua  (client / injector)
+-- Fix: anchor visual parts + snap PrimaryPart to target every frame (no Lerp) to avoid sinking.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,9 +12,8 @@ local TEMPLATE_NAME = "Deer"
 local IDLE_ID = "rbxassetid://138304500572165"
 local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
-local LERP_ALPHA = 0.45        -- 0..1, 1 = instant
 local FP_HIDE_DISTANCE = 0.6
-local HIP_MANUAL_OFFSET = nil  -- set number to force, otherwise auto-calc from feet
+local HIP_MANUAL_OFFSET = nil  -- nil = auto compute
 
 -- internals
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
@@ -36,8 +35,8 @@ local function setLocalVisibility(model, visible)
         if v:IsA("BasePart") then
             pcall(function()
                 v.LocalTransparencyModifier = visible and 0 or 1
+                -- keep CanCollide false for visual safety
                 v.CanCollide = false
-                if v.Massless ~= nil then v.Massless = true end
             end)
         end
     end
@@ -50,7 +49,7 @@ local function isFirstPerson()
     return (cam.CFrame.Position - head.Position).Magnitude < FP_HIDE_DISTANCE
 end
 
--- compute the lowest Y (bottom) of a model's BaseParts
+-- lowest Y (feet)
 local function lowestY(model)
     if not model then return nil end
     local minY = math.huge
@@ -118,6 +117,19 @@ local function cleanupTools()
     end
 end
 
+local function anchorVisualParts(mdl, anchored)
+    for _, p in ipairs(mdl:GetDescendants()) do
+        if p:IsA("BasePart") then
+            pcall(function()
+                p.Anchored = anchored
+                -- keep non-collidable
+                p.CanCollide = false
+                if p.Massless ~= nil then p.Massless = true end
+            end)
+        end
+    end
+end
+
 local function createVisual()
     if visual then return end
 
@@ -125,15 +137,15 @@ local function createVisual()
     if not ok or not clone then warn("[visual] clone failed:", clone) return end
     clone.Name = VISUAL_NAME
 
-    -- remove scripts/humanoid only inside clone
+    -- sanitize clone: remove Scripts/ModuleScripts and Humanoid (only in clone)
     for _, d in ipairs(clone:GetDescendants()) do
         if d:IsA("Script") or d:IsA("ModuleScript") or d:IsA("Humanoid") then
             pcall(function() d:Destroy() end)
         end
         if d:IsA("BasePart") then
             pcall(function()
-                d.CanCollide = false
                 d.Anchored = false
+                d.CanCollide = false
                 if d.Massless ~= nil then d.Massless = true end
             end)
         end
@@ -145,19 +157,17 @@ local function createVisual()
     clone.Parent = workspace
     visual = clone
 
-    -- FIRST: align feet of visual with real character feet
+    -- ALIGN FEET
     local char = lp.Character or lp.CharacterAdded:Wait()
     local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
     local playerFeet = lowestY(char)
     local visualFeet = lowestY(visual)
     if playerFeet and visualFeet then
         local dy = playerFeet - visualFeet
-        -- apply vertical shift to visual so its feet match player's feet
         pcall(function()
             if visual.PrimaryPart then
                 visual:SetPrimaryPartCFrame(visual.PrimaryPart.CFrame * CFrame.new(0, dy, 0))
             else
-                -- move whole model by changing all parts (fallback)
                 for _,p in ipairs(visual:GetDescendants()) do
                     if p:IsA("BasePart") then p.CFrame = p.CFrame * CFrame.new(0, dy, 0) end
                 end
@@ -165,10 +175,10 @@ local function createVisual()
         end)
         print(string.format("[visual] aligned feet: playerFeet=%.3f visualFeet(before)=%.3f dy=%.3f", playerFeet, visualFeet, dy))
     else
-        print("[visual] could not compute feet alignment; playerFeet/visualFeet nil")
+        print("[visual] feet alignment failed (playerFeet/visualFeet nil)")
     end
 
-    -- now set up AnimationController (no Humanoid)
+    -- create AnimationController
     animController = Instance.new("AnimationController")
     animController.Name = "LocalVisualAnimController"
     animController.Parent = visual
@@ -182,7 +192,7 @@ local function createVisual()
     -- hide real char locally
     setLocalVisibility(char, false)
 
-    -- compute HIP_OFFSET = visual.PrimaryPart.Y - hrp.Position.Y
+    -- compute HIP_OFFSET robustly: use visual.PrimaryPart.Y - hrp.Position.Y
     local HIP_OFFSET = HIP_MANUAL_OFFSET
     if not HIP_OFFSET then
         if visual.PrimaryPart and hrp then
@@ -193,6 +203,9 @@ local function createVisual()
     end
     print("[visual] HIP_OFFSET computed =", HIP_OFFSET)
 
+    -- anchor visual parts to remove physics influence
+    anchorVisualParts(visual, true)
+
     -- bind tools
     pcall(function() bindTools(lp:FindFirstChildOfClass("Backpack")) end)
     pcall(function() bindTools(char) end)
@@ -201,11 +214,12 @@ local function createVisual()
         pcall(function() setLocalVisibility(newChar, false) end)
     end))
 
-    -- follow-loop: use HIP_OFFSET computed above
+    -- follow loop: SNAP (no Lerp) to ensure stable on floor
     followConn = RunService.RenderStepped:Connect(function()
         if not visual or not visual.PrimaryPart or not hrp then return end
         local fp = isFirstPerson()
         if fp then
+            -- hide visual and hide real locally in FP
             setLocalVisibility(visual, false)
             setLocalVisibility(char, false)
         else
@@ -213,12 +227,12 @@ local function createVisual()
             setLocalVisibility(char, false)
         end
         local target = hrp.CFrame * CFrame.new(0, HIP_OFFSET, 0)
-        local cur = visual.PrimaryPart.CFrame
-        visual:SetPrimaryPartCFrame(cur:Lerp(target, math.clamp(LERP_ALPHA, 0, 1)))
+        -- snap to target to avoid physics sinking
+        pcall(function() visual:SetPrimaryPartCFrame(target) end)
     end)
     addConn(followConn)
 
-    -- connect running -> anim switch
+    -- running -> anim switch
     local realHum = char:FindFirstChildOfClass("Humanoid")
     if realHum and walkTrack then
         local runC = realHum.Running:Connect(function(speed)
