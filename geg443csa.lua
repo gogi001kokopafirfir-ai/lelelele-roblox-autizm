@@ -1,5 +1,5 @@
--- visual-deer-morph.lua  (client / injector)
--- Локальный визуал: real char движется (сервер видит normal, не frozen), visual Deer следует с offset. Real HipHeight low for doors.
+-- visual-deer-morph-fixed.lua  (client / injector)
+-- Fixes: Visibility only on BasePart, smoother SMOOTH, debug prints, Hip low for doors.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -10,9 +10,9 @@ local TEMPLATE_NAME = "Deer"
 local IDLE_ID = "rbxassetid://138304500572165"
 local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
-local SMOOTH = 0.45
+local SMOOTH = 0.8  -- increased for less jitter
 local FP_HIDE_DISTANCE = 0.6
-local HIP_OFFSET = 3.0  -- manual tune: высота разницы Deer vs real (тесть 2-4; print(GetExtentsSize.Y diff in Dex))
+local HIP_OFFSET = 1.5  -- start low, tune up if visual in ground (print diffs in F9)
 
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
 if not template then warn("Deer not found") return end
@@ -37,14 +37,14 @@ end
 
 local function setLocalVisibility(model, visible, excludeArms)
     for _, v in ipairs(model:GetDescendants()) do
-        if v:IsA("BasePart") or v:IsA("Accessory") then
+        if v:IsA("BasePart") then  -- fixed: only BasePart
             local name = v.Name:lower()
             if excludeArms and (name:find("arm") or name:find("hand")) then
                 -- skip arms
             elseif excludeArms and (name:find("head") or name:find("torso") or name:find("leg") or name:find("hair")) then
-                v.LocalTransparencyModifier = 1  -- hide body in FP
+                pcall(function() v.LocalTransparencyModifier = 1 end)  -- hide body in FP
             else
-                v.LocalTransparencyModifier = visible and 0 or 1
+                pcall(function() v.LocalTransparencyModifier = visible and 0 or 1 end)
             end
         end
     end
@@ -116,7 +116,8 @@ local function createVisual()
     local realHum = char:FindFirstChildOfClass("Humanoid")
     if realHum then
         originalHip = realHum.HipHeight
-        realHum.HipHeight = originalHip - HIP_OFFSET  -- опусти real для проходов (low collider)
+        realHum.HipHeight = originalHip - HIP_OFFSET  -- low real for doors
+        print("Debug: Real HipHeight set to", realHum.HipHeight)
     end
     setLocalVisibility(char, false)
 
@@ -162,18 +163,19 @@ local function createVisual()
         if fp then
             setLocalVisibility(visual, false)
             for _, vt in pairs(toolVisuals) do setLocalVisibility(vt, false) end
-            setLocalVisibility(char, true, true)  -- show real arms/body hidden
+            setLocalVisibility(char, true, true)
         else
             setLocalVisibility(visual, true)
             for _, vt in pairs(toolVisuals) do setLocalVisibility(vt, true) end
             setLocalVisibility(char, false)
         end
-        local target = hrp.CFrame * CFrame.new(0, HIP_OFFSET, 0)  -- shift visual up (ноги на земле)
+        local target = hrp.CFrame * CFrame.new(0, HIP_OFFSET, 0)  -- up visual
         local cur = visual.PrimaryPart.CFrame
         visual:SetPrimaryPartCFrame(cur:Lerp(target, SMOOTH))
+        print("Debug: Real HRP.Y = ", hrp.Position.Y, " Visual Prim.Y = ", visual.PrimaryPart.Position.Y)  -- tune OFFSET
     end)
 
-    -- anim switch
+    -- anim
     if realHum and walkTrack then
         realHum.Running:Connect(function(speed)
             if speed > 0.5 then
