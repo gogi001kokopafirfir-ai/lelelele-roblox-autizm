@@ -1,5 +1,5 @@
--- visual-deer-morph-fixed2.lua  (client / injector)
--- Fixes: No negative Hip (no sunk for all), CanCollide=false on real head/torso for door clip, SMOOTH=1 no jitter.
+-- visual-deer-morph-fixed3.lua  (client / injector)
+-- Fixes: Auto OFFSET from extents, no negative Hip (no sunk for all), CanCollide=false on real head/torso for door clip, SMOOTH=1 no jitter.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,7 +12,7 @@ local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
 local SMOOTH = 1  -- max smooth, no jitter
 local FP_HIDE_DISTANCE = 0.6
-local HIP_OFFSET = 1.5  -- tune: (deer height - real height)/2 from Dex
+local HIP_OFFSET = 0  -- manual override if auto not ok; start 0, tune 1-4
 
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
 if not template then warn("Deer not found") return end
@@ -116,11 +116,16 @@ local function createVisual()
     local realHum = char:FindFirstChildOfClass("Humanoid")
     if realHum then
         originalHip = realHum.HipHeight
-        -- no negative, keep original
     end
     setLocalVisibility(char, false)
 
-    -- hack for doors: no collide on real head/torso (local, may help clip)
+    -- auto offset
+    local realHeight = char:GetExtentsSize().Y
+    local visualHeight = visual:GetExtentsSize().Y
+    HIP_OFFSET = (visualHeight - realHeight) / 2  -- auto calc
+    print("Calculated OFFSET =", HIP_OFFSET)  -- check F9, if bad - manual
+
+    -- hack doors: no collide real head/torso
     local head = char:FindFirstChild("Head")
     local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
     if head then pcall(function() head.CanCollide = false end) end
