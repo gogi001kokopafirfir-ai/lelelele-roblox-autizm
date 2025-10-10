@@ -1,5 +1,5 @@
 -- visual-deer-morph-fixed3.lua  (client / injector)
--- Fixes: Auto OFFSET from extents, no negative Hip (no sunk for all), CanCollide=false on real head/torso for door clip, SMOOTH=1 no jitter.
+-- Fixes: Manual OFFSET default 5.0 (tune for no air/ground clip), print extents, no negative Hip.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,7 +12,7 @@ local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
 local SMOOTH = 1  -- max smooth, no jitter
 local FP_HIDE_DISTANCE = 0.6
-local HIP_OFFSET = 0  -- manual override if auto not ok; start 0, tune 1-4
+local HIP_OFFSET = 5.0  -- manual tune here; 5-7 for typical oversized Deer; print below helps
 
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
 if not template then warn("Deer not found") return end
@@ -39,7 +39,7 @@ local function setLocalVisibility(model, visible, excludeArms)
     for _, v in ipairs(model:GetDescendants()) do
         if v:IsA("BasePart") then
             local name = v.Name:lower()
-            if excludeArms and (name:find("arm") or name:find("hand")) then
+            if excludeArms and (name:find("arm") or name:find("hair") or name:find("hand")) then
                 -- skip
             elseif excludeArms and (name:find("head") or name:find("torso") or name:find("leg") or name:find("hair")) then
                 pcall(function() v.LocalTransparencyModifier = 1 end)
@@ -119,11 +119,11 @@ local function createVisual()
     end
     setLocalVisibility(char, false)
 
-    -- auto offset
+    -- auto offset (comment if manual only)
     local realHeight = char:GetExtentsSize().Y
     local visualHeight = visual:GetExtentsSize().Y
-    HIP_OFFSET = (visualHeight - realHeight) / 2  -- auto calc
-    print("Calculated OFFSET =", HIP_OFFSET)  -- check F9, if bad - manual
+    HIP_OFFSET = (visualHeight - realHeight) / 2 - 3  -- subtract 3 for horns/extra; tune -1 to -5 if still high
+    print("Calculated OFFSET =", HIP_OFFSET)
 
     -- hack doors: no collide real head/torso
     local head = char:FindFirstChild("Head")
