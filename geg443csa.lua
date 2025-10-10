@@ -1,5 +1,5 @@
--- visual-deer-morph-fixed3.lua  (client / injector)
--- Fixes: Manual OFFSET default 5.0 (tune for no air/ground clip), print extents, no negative Hip.
+-- visual-deer-morph-fixed4.lua  (client / injector)
+-- Fixes: Hide Decal/GUI on real (for emotions), camera shift up, clone chat bubble to visual Head.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,7 +12,7 @@ local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
 local SMOOTH = 1  -- max smooth, no jitter
 local FP_HIDE_DISTANCE = 0.6
-local HIP_OFFSET = 5.0  -- manual tune here; 5-7 for typical oversized Deer; print below helps
+local HIP_OFFSET = 5.0  -- your tune; adjust for ground
 
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
 if not template then warn("Deer not found") return end
@@ -26,6 +26,7 @@ local toolVisuals = {}
 local toolConns = {}
 local cam = workspace.CurrentCamera
 local originalHip = nil
+local chatClone = nil  -- for bubble
 
 local function safeFindPart(model, names)
     for _, n in ipairs(names) do
@@ -39,13 +40,17 @@ local function setLocalVisibility(model, visible, excludeArms)
     for _, v in ipairs(model:GetDescendants()) do
         if v:IsA("BasePart") then
             local name = v.Name:lower()
-            if excludeArms and (name:find("arm") or name:find("hair") or name:find("hand")) then
+            if excludeArms and (name:find("arm") or name:find("hand")) then
                 -- skip
             elseif excludeArms and (name:find("head") or name:find("torso") or name:find("leg") or name:find("hair")) then
                 pcall(function() v.LocalTransparencyModifier = 1 end)
             else
                 pcall(function() v.LocalTransparencyModifier = visible and 0 or 1 end)
             end
+        elseif v:IsA("Decal") then  -- fix emotions/face
+            pcall(function() v.Transparency = visible and 0 or 1 end)
+        elseif v:IsA("BillboardGui") or v:IsA("SurfaceGui") then  -- hide other GUIs
+            pcall(function() v.Enabled = visible end)
         end
     end
 end
@@ -119,7 +124,7 @@ local function createVisual()
     end
     setLocalVisibility(char, false)
 
-    -- auto offset (comment if manual only)
+    -- auto offset (comment if manual only; subtract for overheight)
     local realHeight = char:GetExtentsSize().Y
     local visualHeight = visual:GetExtentsSize().Y
     HIP_OFFSET = (visualHeight - realHeight) / 2 - 3  -- subtract 3 for horns/extra; tune -1 to -5 if still high
@@ -184,6 +189,23 @@ local function createVisual()
         local target = hrp.CFrame * CFrame.new(0, HIP_OFFSET, 0)  -- up visual
         local cur = visual.PrimaryPart.CFrame
         visual:SetPrimaryPartCFrame(cur:Lerp(target, SMOOTH))
+        
+        -- camera shift up (local hack)
+        local currentCFrame = cam.CFrame
+        cam.CFrame = currentCFrame * CFrame.new(0, HIP_OFFSET, 0)  -- shift Y up for TP view
+
+        -- clone chat bubble
+        local realHead = char:FindFirstChild("Head")
+        local visualHead = visual:FindFirstChild("Head")
+        if realHead and visualHead then
+            local realBubble = realHead:FindFirstChildOfClass("BillboardGui")
+            if realBubble and not chatClone then
+                chatClone = realBubble:Clone()
+                chatClone.Parent = visualHead
+                chatClone.Adornee = visualHead
+                realBubble.Enabled = false  -- hide real
+            end
+        end
     end)
 
     -- anim
@@ -204,12 +226,15 @@ local function revert()
     if followConn then followConn:Disconnect() end
     cleanupTools()
     if visual then visual:Destroy() end
-    visual = nil; animator = nil; idleTrack = nil; walkTrack = nil
+    if chatClone then chatClone:Destroy() end
+    visual = nil; animator = nil; idleTrack = nil; walkTrack = nil; chatClone = nil
     local char = lp.Character
     if char then
         local hum = char:FindFirstChildOfClass("Humanoid")
         if hum and originalHip then hum.HipHeight = originalHip end
         setLocalVisibility(char, true)
+        local realBubble = char.Head:FindFirstChildOfClass("BillboardGui")
+        if realBubble then realBubble.Enabled = true end
     end
     print("Reverted")
 end
