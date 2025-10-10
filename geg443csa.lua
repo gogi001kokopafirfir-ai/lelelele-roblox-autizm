@@ -138,7 +138,7 @@ local function createVisual()
     local chatConfig = game.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
     if chatConfig then
         originalChatOffset = chatConfig.VerticalStudsOffset
-        chatConfig.VerticalStudsOffset = HIP_OFFSET + 1  -- tune +1 for above Deer head
+        chatConfig.VerticalStudsOffset = HIP_OFFSET + 2  -- tune +1 for above Deer head
         print("Chat offset set to", chatConfig.VerticalStudsOffset)
     end
 
