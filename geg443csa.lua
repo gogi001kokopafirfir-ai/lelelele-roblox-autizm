@@ -1,7 +1,8 @@
--- morph-deer-inject-fixed-hip.lua  (client / injector)
--- Fixes: HipHeight to original for doors/height, proper pcall, checks.
+-- morph-deer-inject-fixed.lua  (client / injector)
+-- Fixes: proper pcall in loadAnim, checks for hum/anim load.
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 
 local lp = Players.LocalPlayer
@@ -10,11 +11,10 @@ if not lp then warn("No LocalPlayer") return end
 local TEMPLATE = workspace:FindFirstChild("Deer")
 if not TEMPLATE then warn("Deer not found") return end
 
-local IDLE_ID = "rbxassetid://138304500572165"  -- тесть ID в Studio
+local IDLE_ID = "rbxassetid://138304500572165"  -- тесть в Studio, если fail — invalid ID
 local WALK_ID = "rbxassetid://78826693826761"
 
 local AUTO_MORPH_ON_LOAD = true
-local FIXED_HIP = 1.0  -- manual tune: original R15 ~2.0; уменьши, если всё равно высоко/не проходит
 local morphedData = {}
 
 local function getRoot(model)
@@ -31,9 +31,9 @@ end
 local function loadAnim(animator, id, looped, priority)
     local anim = Instance.new("Animation")
     anim.AnimationId = id
-    local success, track = pcall(animator.LoadAnimation, animator, anim)
+    local success, track = pcall(animator.LoadAnimation, animator, anim)  -- fixed pcall
     if not success then
-        warn("Failed load " .. id .. ": " .. tostring(track))
+        warn("Failed load anim " .. id .. ": " .. tostring(track))  -- track = error msg
         anim:Destroy()
         return nil
     end
@@ -44,12 +44,12 @@ end
 
 local function setupAnims(char)
     local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum then warn("No Humanoid") return nil, nil, nil end
+    if not hum then warn("No Humanoid in Deer clone") return nil, nil, nil end
     local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
     local idle = loadAnim(animator, IDLE_ID, true)
     local walk = loadAnim(animator, WALK_ID, true)
-    if not idle or not walk then warn("Anims fail") return nil, nil, nil end
-    idle:Play()
+    if not idle or not walk then warn("Anims failed to load — check IDs") return nil, nil, nil end
+    idle:Play()  -- start idle
 
     local conn = hum.Running:Connect(function(speed)
         if speed > 0.5 then
@@ -69,8 +69,6 @@ local function morphPlayer(plr)
 
     local oldChar = plr.Character or plr.CharacterAdded:Wait()
     if not oldChar then warn("No old char") return end
-    local oldHum = oldChar:FindFirstChildOfClass("Humanoid")
-    local originalHip = oldHum and oldHum.HipHeight or FIXED_HIP  -- save original
 
     local clone = TEMPLATE:Clone()
     clone.Name = plr.Name
@@ -84,17 +82,10 @@ local function morphPlayer(plr)
     clone.Parent = workspace
 
     local idle, walk, animConn = setupAnims(clone)
-    if not idle then warn("Anims failed, abort") clone:Destroy() return end
-
-    -- fix height for doors: set to original HipHeight
-    local newHum = clone:FindFirstChildOfClass("Humanoid")
-    if newHum then
-        newHum.HipHeight = originalHip  -- or FIXED_HIP if nil
-        print("Set Deer HipHeight to", newHum.HipHeight)  -- debug F9
-    end
+    if not idle then warn("Setup anims failed — morph aborted") clone:Destroy() return end
 
     local success = pcall(function() plr.Character = clone end)
-    if not success then warn("Set char failed") clone:Destroy() return end
+    if not success then warn("Failed to set plr.Character — injector rights?") clone:Destroy() return end
     safeSetCamera(clone)
 
     -- tools transfer
@@ -145,4 +136,4 @@ if AUTO_MORPH_ON_LOAD then
     morphPlayer(lp)
 end
 
-print("[Deer Morph Hip Fix] Ready. M = morph, R = revert.")
+print("[Deer Morph Fixed] Ready. M = morph, R = revert.")
