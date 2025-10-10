@@ -1,5 +1,6 @@
 -- visual-deer-morph-fixed4.lua  (client / injector)
 -- Fixes: Decal (face) hide in visibility, chat bubble offset, auto OFFSET with adjust, no negative Hip.
+-- New: Hide real arms/hands/tool in FP to avoid dup with game's Particles FP system.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -138,7 +139,7 @@ local function createVisual()
     local chatConfig = game.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
     if chatConfig then
         originalChatOffset = chatConfig.VerticalStudsOffset
-        chatConfig.VerticalStudsOffset = HIP_OFFSET + 2  -- tune +1 for above Deer head
+        chatConfig.VerticalStudsOffset = HIP_OFFSET + 1  -- tune +1 for above Deer head
         print("Chat offset set to", chatConfig.VerticalStudsOffset)
     end
 
@@ -162,7 +163,7 @@ local function createVisual()
         container.ChildAdded:Connect(function(child)
             if child:IsA("Tool") then
                 toolConns[child] = child.Equipped:Connect(onEquip)
-                toolConns[child.."_un"] = child.Unequipped:Connect(onUnequip)
+                toolConns[t.."_un"] = child.Unequipped:Connect(onUnequip)
             end
         end)
     end
@@ -187,6 +188,19 @@ local function createVisual()
             setLocalVisibility(visual, false)
             for _, vt in pairs(toolVisuals) do setLocalVisibility(vt, false) end
             setLocalVisibility(char, true, true)
+            -- hide real arms/hands to avoid dup with Particles FP arms
+            local arms = {"RightUpperArm", "LeftUpperArm", "RightLowerArm", "LeftLowerArm", "RightHand", "LeftHand"}
+            for _, name in ipairs(arms) do
+                local part = char:FindFirstChild(name)
+                if part then pcall(function() part.LocalTransparencyModifier = 1 end) end
+            end
+            -- hide real tool if equipped (Handle)
+            for _, child in ipairs(char:GetChildren()) do
+                if child:IsA("Tool") then
+                    local handle = child:FindFirstChild("Handle")
+                    if handle then pcall(function() handle.LocalTransparencyModifier = 1 end) end
+                end
+            end
         else
             setLocalVisibility(visual, true)
             for _, vt in pairs(toolVisuals) do setLocalVisibility(vt, true) end
