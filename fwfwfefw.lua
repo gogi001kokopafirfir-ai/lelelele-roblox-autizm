@@ -1,5 +1,6 @@
--- visual-deer-morph-fixed11.lua  (client / injector)
--- Added: Visual tool clone/attach to Deer hand on equip, manual offset tune.
+-- visual-deer-morph-fixed11.lua  (patch with tool visual in hand)
+-- Added: Clone ToolHandle on equip, attach to Deer hand (align rigid, no anim).
+-- Tune: Add names to handNames if rig differ; manual gripOffset if not fit (CFrame.new(0,0,0) * CFrame.Angles(...)).
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -13,7 +14,6 @@ local WALK_ID = "rbxassetid://78826693826761"
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
 local FP_HIDE_DISTANCE = 0.6
 local HIP_MANUAL_OFFSET = nil
-local TOOL_OFFSET = CFrame.new(0, 0, 0) * CFrame.Angles(0, 0, 0)  -- manual tune pos/rot with F3X (e.g. Vector3(0.5, 0, -1), math.rad(90,0,0))
 
 local template = workspace:FindFirstChild(TEMPLATE_NAME)
 if not template then warn("Deer template not found") return end
@@ -24,7 +24,7 @@ local connections = {}
 local toolConns = {}
 local childAddedConns = {}
 local cam = workspace.CurrentCamera
-local currentToolVisual = nil  -- current visual tool
+local toolVisuals = {}  -- added for tool clones cleanup
 
 local function addConn(c) if c then table.insert(connections, c) end end
 local function disconnectAll() for _,c in ipairs(connections) do pcall(function() c:Disconnect() end) end connections = {} end
@@ -77,26 +77,48 @@ local function loadTrack(animObj, id, looped)
     return track
 end
 
-local function createVisualTool(tool)
-    if not visual then return end
-    -- clone ToolHandle if exist, else tool itself
-    local handle = workspace:FindFirstChild("ToolHandle") or tool:FindFirstChild("Handle") or tool  -- game custom ToolHandle
-    if not handle then return end
-    local vHandle = handle:Clone()
-    vHandle.Name = "VISUAL_TOOL_" .. (tool.Name or "Tool")
+local function createToolVisual(toolHandle)
+    if not visual or not toolHandle then return nil end
+    local vHandle = toolHandle:Clone()
+    vHandle.Name = "VISUAL_TOOLHANDLE_" .. (toolHandle.Name or "Tool")
     vHandle.Parent = visual
-    setLocalVisibility(vHandle, true, true)  -- apply visual props
+    setLocalVisibility(vHandle, true, true)  -- apply visual rules (no collide/mass)
 
-    local deerHand = safeFindPart(visual, {"RightHand", "RightUpperArm", "RightArm"})
-    if not deerHand then deerHand = visual.PrimaryPart end
-    local gripAtt = vHandle:FindFirstChild("RightGripAttachment") or Instance.new("Attachment", vHandle)  -- use existing or new
+    -- find hand in visual
+    local handNames = {"RightHand", "Right Arm", "RightUpperArm", "Hand", "Arm"}  -- add more if rig differ
+    local hand = safeFindPart(visual, handNames)
+    if not hand then
+        warn("No hand found in visual, fallback to PrimaryPart")
+        hand = visual.PrimaryPart
+    end
 
-    local handAtt = Instance.new("Attachment", deerHand)
-    local ap = Instance.new("AlignPosition", vHandle); ap.Attachment0 = gripAtt; ap.Attachment1 = handAtt; ap.RigidityEnabled = true; ap.MaxForce = math.huge; ap.Responsiveness = 200
-    local ao = Instance.new("AlignOrientation", vHandle); ao.Attachment0 = gripAtt; ao.Attachment1 = handAtt; ao.RigidityEnabled = true; ao.MaxTorque = math.huge; ao.Responsiveness = 200
+    -- find grip in vHandle
+    local gripNames = {"RightGripAttachment", "Grip", "HandleAttachment"}  -- game grip points
+    local attV = vHandle:FindFirstChildWhichIsA("Attachment") or safeFindPart(vHandle, gripNames)
+    if not attV then
+        attV = Instance.new("Attachment", vHandle:FindFirstChildWhichIsA("BasePart") or vHandle.PrimaryPart)
+    end
 
-    -- manual offset apply
-    gripAtt.CFrame = TOOL_OFFSET
+    local attH = hand:FindFirstChild("RightGripAttachment") or Instance.new("Attachment", hand)
+    attH.Name = "VisualGripAtt"
+
+    local ap = Instance.new("AlignPosition", vHandle)
+    ap.Attachment0 = attV
+    ap.Attachment1 = attH
+    ap.RigidityEnabled = true
+    ap.MaxForce = math.huge
+    ap.Responsiveness = 200
+
+    local ao = Instance.new("AlignOrientation", vHandle)
+    ao.Attachment0 = attV
+    ao.Attachment1 = attH
+    ao.RigidityEnabled = true
+    ao.MaxTorque = math.huge
+    ao.Responsiveness = 200
+
+    -- manual offset if need (from F3X: get CFrame relative to hand)
+    local gripOffset = CFrame.new(0, 0, 0) * CFrame.Angles(0, 0, 0)  -- tune here, e.g. CFrame.new(0, -0.5, -1) * CFrame.Angles(math.rad(90), 0, 0)
+    attH.CFrame = gripOffset
 
     return vHandle
 end
@@ -107,13 +129,16 @@ local function bindTools(container)
         if t:IsA("Tool") and not toolConns[t] then
             toolConns[t] = {}
             toolConns[t].equip = t.Equipped:Connect(function()
-                setLocalVisibility(t, false, false)
-                if currentToolVisual then currentToolVisual:Destroy() end
-                currentToolVisual = createVisualTool(t)
+                setLocalVisibility(t, false, true)
+                -- clone ToolHandle if exists (game's custom model)
+                local toolHandle = lp.Character:FindFirstChild("ToolHandle")
+                if toolHandle then
+                    toolVisuals[t] = createToolVisual(toolHandle)
+                end
             end)
             toolConns[t].unequip = t.Unequipped:Connect(function()
-                setLocalVisibility(t, true, false)
-                if currentToolVisual then currentToolVisual:Destroy() currentToolVisual = nil end
+                setLocalVisibility(t, true, true)
+                if toolVisuals[t] then pcall(function() toolVisuals[t]:Destroy() end) toolVisuals[t] = nil end
             end)
             addConn(toolConns[t].equip); addConn(toolConns[t].unequip)
         end
@@ -123,13 +148,15 @@ local function bindTools(container)
             if child:IsA("Tool") and not toolConns[child] then
                 toolConns[child] = {}
                 toolConns[child].equip = child.Equipped:Connect(function()
-                    setLocalVisibility(child, false, false)
-                    if currentToolVisual then currentToolVisual:Destroy() end
-                    currentToolVisual = createVisualTool(child)
+                    setLocalVisibility(child, false, true)
+                    local toolHandle = lp.Character:FindFirstChild("ToolHandle")
+                    if toolHandle then
+                        toolVisuals[child] = createToolVisual(toolHandle)
+                    end
                 end)
                 toolConns[child].unequip = child.Unequipped:Connect(function()
-                    setLocalVisibility(child, true, false)
-                    if currentToolVisual then currentToolVisual:Destroy() currentToolVisual = nil end
+                    setLocalVisibility(child, true, true)
+                    if toolVisuals[child] then pcall(function() toolVisuals[child]:Destroy() end) toolVisuals[child] = nil end
                 end)
                 addConn(toolConns[child].equip); addConn(toolConns[child].unequip)
             end
@@ -145,7 +172,7 @@ local function cleanupTools()
         toolConns[tool] = nil
     end
     for c, conn in pairs(childAddedConns) do pcall(function() conn:Disconnect() end) childAddedConns[c] = nil end
-    if currentToolVisual then currentToolVisual:Destroy() currentToolVisual = nil end
+    for _, v in pairs(toolVisuals) do pcall(function() v:Destroy() end) end toolVisuals = {}
 end
 
 local function createVisual()
@@ -256,3 +283,7 @@ local function revertVisual()
 end
 
 -- run
+createVisual()
+_G.revertVisual = revertVisual
+
+Проверь если этот скрипт работает, если что то сломал то подправь, но мне кажется он нормальный. Если все ок то я перейду к следующей задаче.
