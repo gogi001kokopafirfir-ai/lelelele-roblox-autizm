@@ -1,5 +1,6 @@
 -- visual-deer-morph-fixed11.lua  (patch with tool visual in hand)
 -- Added: Clone ToolHandle on equip, attach to Deer hand (align rigid, no anim).
+-- Fixed: Typo in toolConns keys (child.."_un" -> child].unequip).
 -- Tune: Add names to handNames if rig differ; manual gripOffset if not fit (CFrame.new(0,0,0) * CFrame.Angles(...)).
 
 local Players = game:GetService("Players")
@@ -119,6 +120,8 @@ local function createToolVisual(toolHandle)
     -- manual offset if need (from F3X: get CFrame relative to hand)
     local gripOffset = CFrame.new(0, 0, 0) * CFrame.Angles(0, 0, 0)  -- tune here, e.g. CFrame.new(0, -0.5, -1) * CFrame.Angles(math.rad(90), 0, 0)
     attH.CFrame = gripOffset
+
+    print("[tool] Cloned ToolHandle to visual")
 
     return vHandle
 end
