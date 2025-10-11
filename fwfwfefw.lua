@@ -1,173 +1,150 @@
--- simple-tool-attach.lua  (локальный инжектор, компактный)
--- Клонирует Handle/part предмета при Equipped и weld'ит к визуалу Deer.
+-- attach-tool-via-inventory.lua  (локальный, краткий)
+-- Минимум: когда игра экипует предмет (EquipItemHandle), клонируем ToolHandle и привязываем к LOCAL_DEER_VISUAL
 
 local Players = game:GetService("Players")
 local lp = Players.LocalPlayer
 if not lp then return end
 
--- Настройки
-local VISUAL_NAME = "LOCAL_DEER_VISUAL"      -- имя визуальной модели (должна уже быть в workspace)
-local HAND_OFFSET = CFrame.new(0, -0.15, -0.5) * CFrame.Angles(0, 0, 0) -- подгоняй (Y вверх/вниз, Z вперед/назад)
-local ATTACH_ORDER = {"RightGripAttachment","RightHandAttachment","RightHand","Right Arm","UpperTorso","HumanoidRootPart"}
-
--- internal
-local visual = workspace:FindFirstChild(VISUAL_NAME)
-if not visual then warn("[attach] visual not found:", VISUAL_NAME) end
-
-local currentClone = nil
-local currentTool = nil
-local currentConn = nil
-
-local function findTargetPart()
-    if not visual then return nil, nil end
-    for _, name in ipairs(ATTACH_ORDER) do
-        local found = visual:FindFirstChild(name, true)
-        if found then
-            if found:IsA("Attachment") and found.Parent and found.Parent:IsA("BasePart") then
-                return found.Parent, found
-            elseif found:IsA("BasePart") then
-                return found, nil
-            end
-        end
-    end
-    -- fallback
-    local prim = visual:FindFirstChild("HumanoidRootPart") or visual.PrimaryPart
-    return prim, nil
+-- require client module (игра уже использует его)
+local ok, Client = pcall(function() return require(lp.PlayerScripts:WaitForChild("Client")) end)
+if not ok or not Client or not Client.Events then
+    warn("[attach] не удалось require Client module")
+    Client = nil
 end
 
-local function findPartFromTool(tool)
-    if not tool then return nil end
-    -- prefer Handle
-    local h = tool:FindFirstChild("Handle", true)
-    if h and h:IsA("BasePart") then return h end
-    -- try workspace.<player>.ToolHandle (game-specific case)
-    local plFolder = workspace:FindFirstChild(lp.Name)
-    if plFolder then
-        local th = plFolder:FindFirstChild("ToolHandle", true) or plFolder:FindFirstChild("ToolHandle")
-        if th then
-            for _, d in ipairs(th:GetDescendants()) do
-                if d:IsA("BasePart") then return d end
-            end
+local VISUAL_NAME = "LOCAL_DEER_VISUAL"    -- имя визуала
+local HAND_OFFSET = CFrame.new(0, -0.15, -0.5)  -- подгоняй при необходимости
+local myClone = nil
+
+local function findVisualTarget()
+    local visual = workspace:FindFirstChild(VISUAL_NAME)
+    if not visual then return nil end
+    -- попробуем найти attachment / руку
+    local att = visual:FindFirstChild("RightGripAttachment", true) or visual:FindFirstChild("RightHandAttachment", true)
+    if att and att.Parent and att.Parent:IsA("BasePart") then
+        return att.Parent, att
+    end
+    return visual:FindFirstChild("HumanoidRootPart") or visual.PrimaryPart, nil
+end
+
+local function cloneAndAttachToolHandle(originalHandleFolder)
+    if not originalHandleFolder then return end
+    local visualTarget, visualAttachment = findVisualTarget()
+    if not visualTarget then return end
+
+    -- сначала очистим прошлый клон
+    if myClone and myClone.Parent then
+        pcall(function() myClone:Destroy() end)
+        myClone = nil
+    end
+
+    -- клонируем весь ToolHandle (модель/папку)
+    local ok, cloned = pcall(function() return originalHandleFolder:Clone() end)
+    if not ok or not cloned then return end
+    cloned.Name = "LOCAL_TOOL_HANDLE_CLONE"
+    -- sanitize: выключаем скрипты и коллизии, делаем видимым
+    for _, v in ipairs(cloned:GetDescendants()) do
+        if v:IsA("BasePart") then
+            pcall(function()
+                v.CanCollide = false
+                v.LocalTransparencyModifier = 0
+                v.Transparency = 0
+                if v.Massless ~= nil then v.Massless = true end
+            end)
+        elseif v:IsA("Script") or v:IsA("LocalScript") or v:IsA("ModuleScript") then
+            pcall(function() v:Destroy() end)
         end
     end
-    -- fallback: first BasePart inside tool
-    for _, d in ipairs(tool:GetDescendants()) do
-        if d:IsA("BasePart") then return d end
+
+    -- parent to visual (so it moves with player & easy cleanup)
+    cloned.Parent = workspace -- parent ставим в workspace, затем привяжем к visualTarget
+    -- определяем первичную часть
+    local prim = cloned.PrimaryPart or cloned:FindFirstChildWhichIsA("BasePart", true)
+    if not prim then
+        cloned:Destroy()
+        return
+    end
+
+    -- позиционируем и weld
+    local base = visualTarget.CFrame
+    if visualAttachment and visualAttachment:IsA("Attachment") then
+        base = visualTarget.CFrame * visualAttachment.CFrame
+    end
+    pcall(function() cloned:SetPrimaryPartCFrame(base * HAND_OFFSET) end)
+
+    local weld = Instance.new("WeldConstraint")
+    weld.Part0 = prim
+    weld.Part1 = visualTarget
+    weld.Parent = prim
+
+    myClone = cloned
+    print("[attach] tool clone attached to visual")
+end
+
+local function tryFindToolHandleForLocalPlayer()
+    -- game-specific paths you observed: workspace.<playername>.ToolHandle
+    local folderParent = workspace:FindFirstChild(lp.Name)
+    if folderParent then
+        local th = folderParent:FindFirstChild("ToolHandle")
+        if th then return th end
+    end
+    -- fallback: check character
+    if lp.Character then
+        local th2 = lp.Character:FindFirstChild("ToolHandle")
+        if th2 then return th2 end
+    end
+    -- fallback: any ToolHandle in workspace that has OriginalItem pointing to an item in inventory
+    for _,inst in ipairs(workspace:GetDescendants()) do
+        if inst.Name == "ToolHandle" and inst:IsA("Model") then
+            local ov = inst:FindFirstChild("OriginalItem")
+            if ov and ov.Value and ov.Value.Parent == lp:FindFirstChild("Inventory") then
+                return inst
+            end
+        end
     end
     return nil
 end
 
-local function clearCurrent()
-    if currentConn then
-        pcall(function() currentConn:Disconnect() end)
-        currentConn = nil
-    end
-    if currentClone and currentClone.Parent then
-        pcall(function() currentClone:Destroy() end)
-    end
-    currentClone = nil
-    currentTool = nil
-end
-
-local function attachToolToVisual(tool)
-    clearCurrent()
-    if not tool then return end
-    local srcPart = findPartFromTool(tool)
-    if not srcPart then
-        warn("[attach] no source part found in tool:", tool.Name)
-        return
-    end
-
-    local targetPart, targetAttachment = findTargetPart()
-    if not targetPart then
-        warn("[attach] no visual target found (visual missing or has no hand part)")
-        return
-    end
-
-    -- клонируем только исходную геометрическую часть (чтобы было просто)
-    local ok, clone = pcall(function() return srcPart:Clone() end)
-    if not ok or not clone then
-        warn("[attach] clone failed")
-        return
-    end
-    clone.Name = "LOCAL_TOOL_CLONE"
-    -- безопасные настройки
-    pcall(function()
-        clone.Parent = visual or workspace
-        clone.CanCollide = false
-        clone.LocalTransparencyModifier = 0
-        clone.Transparency = 0
-        if clone.Massless ~= nil then clone.Massless = true end
-    end)
-
-    -- позиционируем и привязываем weld
-    local baseCFrame = targetPart.CFrame
-    if targetAttachment and targetAttachment:IsA("Attachment") then
-        baseCFrame = targetPart.CFrame * targetAttachment.CFrame
-    end
-    pcall(function() clone.CFrame = baseCFrame * HAND_OFFSET end)
-
-    local weld = Instance.new("WeldConstraint")
-    weld.Part0 = clone
-    weld.Part1 = targetPart
-    weld.Parent = clone
-
-    currentClone = clone
-    currentTool = tool
-
-    -- cleanup on tool removal / unequip
-    currentConn = tool.AncestryChanged:Connect(function(_, parent)
-        if not parent then clearCurrent() end
-    end)
-    -- also remove clone when tool unequipped (if tool has event)
-    if tool:FindFirstChildWhichIsA("Tool") == nil then
-        -- do nothing
-    end
-
-    print("[attach] attached clone for tool:", tool.Name, "-> target:", targetPart.Name)
-end
-
--- bind existing backpack & character tools (Equipped)
-local function bindToolInstance(tool)
-    if not tool or not tool:IsA("Tool") then return end
-    -- connect equipped/unequipped
-    tool.Equipped:Connect(function()
-        attachToolToVisual(tool)
-    end)
-    tool.Unequipped:Connect(function()
-        clearCurrent()
-    end)
-    -- if tool removed entirely
-    tool.AncestryChanged:Connect(function(_, parent)
-        if not parent then clearCurrent() end
-    end)
-end
-
-local backpack = lp:FindFirstChildOfClass("Backpack")
-if backpack then
-    for _, t in ipairs(backpack:GetChildren()) do
-        if t:IsA("Tool") then bindToolInstance(t) end
-    end
-    backpack.ChildAdded:Connect(function(c) if c:IsA("Tool") then bindToolInstance(c) end end)
-end
-if lp.Character then
-    for _, t in ipairs(lp.Character:GetChildren()) do if t:IsA("Tool") then bindToolInstance(t) end end
-    lp.Character.ChildAdded:Connect(function(c) if c:IsA("Tool") then bindToolInstance(c) end end)
-end
-
--- quick helper: if tool is already equipped (some games auto-equip), try to attach immediately
-task.defer(function()
-    local char = lp.Character
-    if char then
-        for _, t in ipairs(char:GetChildren()) do
-            if t:IsA("Tool") then
-                -- if tool has Handle moved to ToolHandle, findPartFromTool will try workspace[lp.Name].ToolHandle
-                -- attach once
-                attachToolToVisual(t)
-                break
-            end
+-- Если есть клиентский модуль — подпишемся на его события
+if Client and Client.Events and Client.Events.EquipItemHandle then
+    Client.Events.EquipItemHandle:Connect(function(playerArg, itemArg)
+        -- Аргументы: (player, item) — проверяем, наш ли игрок
+        if playerArg ~= lp and playerArg ~= lp and playerArg.UserId ~= lp.UserId then
+            return
         end
-    end
-end)
+        -- небольшая задержка, чтобы игра успела собрать ToolHandle
+        task.delay(0.06, function()
+            local th = tryFindToolHandleForLocalPlayer()
+            if th then
+                cloneAndAttachToolHandle(th)
+            end
+        end)
+    end)
 
-print("[attach] simple tool attach running. VISUAL:", tostring(visual and visual.Name or "nil"))
+    Client.Events.UnequipItemHandle:Connect(function(playerArg, itemArg)
+        if playerArg ~= lp and (not playerArg.UserId or playerArg.UserId ~= lp.UserId) then return end
+        -- удаляем локальную копию при снятии
+        if myClone and myClone.Parent then pcall(function() myClone:Destroy() end) end
+        myClone = nil
+    end)
+else
+    -- fallback: если не удалось require Client, просто следим за появлением ToolHandle в workspace.<playerName>
+    workspace.DescendantAdded:Connect(function(inst)
+        if inst.Name == "ToolHandle" then
+            -- если нашли ToolHandle для нашего игрока — attach
+            task.delay(0.06, function()
+                local th = tryFindToolHandleForLocalPlayer()
+                if th then cloneAndAttachToolHandle(th) end
+            end)
+        end
+    end)
+    -- и слушаем их удаление/ун экип
+    workspace.DescendantRemoving:Connect(function(inst)
+        if inst.Name == "ToolHandle" and myClone and myClone.Parent then
+            pcall(function() myClone:Destroy() end)
+            myClone = nil
+        end
+    end)
+end
+
+print("[attach] ready — will clone ToolHandle to LOCAL_DEER_VISUAL on equip")
