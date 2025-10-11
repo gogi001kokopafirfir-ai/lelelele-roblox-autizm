@@ -1,214 +1,201 @@
--- attach-toolhandle-to-deer.lua  (client / injector)
--- Автомат: наблюдает за workspace.ToolHandle, клонирует визуалы и привязывает их к Deer визуалу.
--- Консольные команды:
---   _G.ReloadDeerTools()          -- пересоздаёт привязки по текущему ToolHandle (если есть)
---   _G.ClearDeerTools()           -- удаляет все визуальные прикрепления
---   _G.SetToolOffset(name, pos, rotDeg)  -- сохраняет/меняет offset для инструмента (pos Vector3, rotDeg Vector3 (deg))
---   _G.ListAttachedTools()        -- печатает список текущих привязанных
--- Настрой: если имя deer'а другое — поменяй VISUAL_NAME.
+-- attach-tool-to-deer.lua  (локальный, инжектор)
+-- Делает локальную копию взятого тулза и закрепляет её у визуала (Deer).
 
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
 
-local VISUAL_NAME = "LOCAL_DEER_VISUAL" -- имя визуальной модели deer в workspace
-local TOOL_HANDLE_FOLDER_NAME = "ToolHandle" -- имя папки, которая появляется в workspace при экипировке
-local ATTACHED_FOLDER_NAME = "Deer_AttachedTools" -- где будут храниться визуальные копии внутри deer
+local lp = Players.LocalPlayer
+if not lp then return end
 
--- default offsets (можешь заполнять через SetToolOffset)
--- формат: offsets["OriginalItem"] = {pos = Vector3.new(x,y,z), rot = Vector3.new(rx,ry,rz)} (rot в градусах)
-local offsets = {}
+-- Настройки:
+local VISUAL_NAME = "LOCAL_DEER_VISUAL"  -- имя визуальной модели Deer (та, что мы создавали)
+local HAND_OFFSET_CFRAME = CFrame.new(0, -0.2, -0.6) -- финальная позиция предмета относительно targetPart (подгоняй)
+local SEARCH_ATTACHMENT_NAMES = {"RightGripAttachment","RightHandAttachment","RightHand","Right Arm","UpperTorso","HumanoidRootPart"}
+local CLONE_NAME_PREFIX = "LOCAL_TOOL_VIS_"
 
--- internal state
-local visual = workspace:FindFirstChild(VISUAL_NAME)
-local attached = {} -- name -> {model = Model, welds = {...}, offset = {...}}
-local watching = false
-local toolHandleFolder = nil
+-- Внутренние таблицы
+local visualModel = workspace:FindFirstChild(VISUAL_NAME)
+if not visualModel then warn("[tool-attach] visual model not found: "..VISUAL_NAME) return end
 
--- utilities
-local function v3(...) return Vector3.new(...) end
-local function deg2rad(v) return Vector3.new(math.rad(v.X), math.rad(v.Y), math.rad(v.Z)) end
-
-local function findVisual()
-    visual = workspace:FindFirstChild(VISUAL_NAME) or workspace:WaitForChild(VISUAL_NAME, 3)
-    return visual
-end
-
-local function findBestHandPart(model)
-    if not model then return nil end
-    local names = {"RightHand","RightForeleg","RightArm","FrontRightHoof","RightFrontHoof","RightHoof","HoofR","Hand","RightGripAttachment"}
-    -- try case-insensitive search for parts
-    for _, n in ipairs(names) do
-        local found = model:FindFirstChild(n, true)
-        if found and found:IsA("BasePart") then return found end
-    end
-    -- fallback: try to find an Attachment named RightGripAttachment and return its parent
-    for _, a in ipairs(model:GetDescendants()) do
-        if a:IsA("Attachment") and string.lower(a.Name):match("right") then
-            if a.Parent and a.Parent:IsA("BasePart") then return a.Parent end
+local equippedMap = {} -- tool -> {clone = part, weld = WeldConstraint}
+local toolConns = {}   -- tool -> { equipConn, unequipConn }
+local function findTargetPartInVisual()
+    if not visualModel then return nil end
+    -- ищем attachment/part для правой руки в визуале
+    for _, name in ipairs(SEARCH_ATTACHMENT_NAMES) do
+        local inst = visualModel:FindFirstChild(name, true)
+        if inst and inst:IsA("BasePart") then
+            return inst
+        end
+        if inst and inst:IsA("Attachment") then
+            -- если нашли attachment — используем его.Parent как targetPart, и применим attachment.CFrame
+            if inst.Parent and inst.Parent:IsA("BasePart") then
+                return inst.Parent, inst
+            end
         end
     end
-    -- last fallback: PrimaryPart
-    if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then return model.PrimaryPart end
-    -- try any BasePart
-    for _, p in ipairs(model:GetDescendants()) do
-        if p:IsA("BasePart") then return p end
+    -- fallback: PrimaryPart
+    return visualModel.PrimaryPart, nil
+end
+
+-- находит подходящую BasePart внутри тулза (Handle или первая BasePart)
+local function findToolHandlePart(tool)
+    if not tool then return nil end
+    -- сначала стандартный Handle
+    local handle = tool:FindFirstChild("Handle", true)
+    if handle and handle:IsA("BasePart") then return handle end
+    -- иначе первая BasePart внутри тулза
+    for _, v in ipairs(tool:GetDescendants()) do
+        if v:IsA("BasePart") then return v end
+    end
+    -- if ToolHandle folder exists in workspace (game-specific), try to find related ToolHandle by Player name
+    local th = workspace:FindFirstChild("ToolHandle", true) -- best-effort; may not exist
+    if th then
+        for _, v in ipairs(th:GetDescendants()) do
+            if v:IsA("BasePart") then return v end
+        end
     end
     return nil
 end
 
--- clean clone: remove scripts and internal welds/motor6d/etc.
-local function sanitizeClone(m)
-    for _,d in ipairs(m:GetDescendants()) do
-        if d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript")
-        or d:IsA("Weld") or d:IsA("WeldConstraint") or d:IsA("Motor6D")
-        or d:IsA("AlignOrientation") or d:IsA("AlignPosition") then
-            pcall(function() d:Destroy() end)
-        end
-        if d:IsA("BasePart") then
-            pcall(function()
-                d.CanCollide = false
-                if d.Massless ~= nil then d.Massless = true end
-                d.LocalTransparencyModifier = 0
-            end)
-        end
+local function makeLocalCloneOfPart(part)
+    if not part then return nil end
+    local ok, clone = pcall(function() return part:Clone() end)
+    if not ok or not clone then return nil end
+    clone.Name = CLONE_NAME_PREFIX .. (part.Name or "part")
+    -- safety: make it non-collidable and massless so it doesn't interfere
+    pcall(function()
+        clone.CanCollide = false
+        if clone:IsA("BasePart") and clone.Massless ~= nil then clone.Massless = true end
+    end)
+    return clone
+end
+
+local function attachCloneToVisual(clonePart, targetPart, targetAttachment)
+    if not clonePart or not targetPart then return nil end
+    -- parent clone under visual model to keep things organized
+    clonePart.Parent = visualModel
+
+    -- Position clone to desired CFrame relative to target
+    -- if we have an attachment, use its world CFrame as base
+    local baseCFrame = targetPart.CFrame
+    if targetAttachment and targetAttachment:IsA("Attachment") then
+        baseCFrame = targetPart.CFrame * targetAttachment.CFrame
     end
+    -- compute target world CFrame for clone
+    local targetWorld = baseCFrame * HAND_OFFSET_CFRAME
+    pcall(function() clonePart.CFrame = targetWorld end)
+
+    -- create WeldConstraint between clonePart and targetPart
+    local weld = Instance.new("WeldConstraint")
+    weld.Part0 = clonePart
+    weld.Part1 = targetPart
+    weld.Parent = clonePart
+
+    -- Ensure clone is visible locally (if you hide real tools)
+    -- optionally tweak Transparency/Material here
+
+    return weld
 end
 
-local function clearAttached()
-    for name,info in pairs(attached) do
-        pcall(function()
-            if info.model and info.model.Parent then info.model:Destroy() end
-        end)
-        attached[name] = nil
+local function onToolEquipped(tool)
+    if not tool or equippedMap[tool] then return end
+    -- find the "handle" part inside the tool
+    local handlePart = findToolHandlePart(tool)
+    if not handlePart then
+        warn("[tool-attach] no handle found in tool:", tool.Name)
+        return
     end
-end
 
-local function listAttached()
-    for name,info in pairs(attached) do
-        print("Attached:", name, "model:", info.model and info.model:GetFullName() or "nil", "offset:", info.offset and info.offset.pos, info.offset and info.offset.rot)
+    -- find visual target (part in deer and optional attachment)
+    local targetPart, targetAttachment = findTargetPartInVisual()
+    if not targetPart then
+        warn("[tool-attach] no target part in visual found")
+        return
     end
-end
 
--- set offset via console
-_G.SetToolOffset = function(name, pos, rotDeg)
-    if type(name) ~= "string" then error("name string") end
-    pos = pos or Vector3.new(0,0,0)
-    rotDeg = rotDeg or Vector3.new(0,0,0)
-    offsets[name] = {pos = pos, rot = rotDeg}
-    print("Offset set for", name, offsets[name])
-end
-
-_G.ListAttachedTools = listAttached
-_G.ClearDeerTools = function() clearAttached(); print("Cleared attached visuals") end
-
--- attach single tool (folder) -> clone & weld to visual
-local function attachToolFolderToVisual(folder)
-    if not folder or not folder.Parent then return end
-    local v = findVisual()
-    if not v then warn("visual not found") return end
-    local hand = findBestHandPart(v)
-    if not hand then warn("hand part not found in visual") return end
-
-    -- clear old ones
-    clearAttached()
-
-    -- If folder contains multiple parts/models, we treat each top-level child as a thing to attach
-    for _,child in ipairs(folder:GetChildren()) do
-        -- We only clone reasonable things (BasePart or Model)
-        if child:IsA("Model") or child:IsA("BasePart") or child:IsA("Folder") then
-            local clone = child:Clone()
-            clone.Name = ("deervis_%s"):format(child.Name)
-            sanitizeClone(clone)
-
-            -- If clone is a single part, wrap into Model for consistent handling
-            local rootPart = clone:IsA("BasePart") and clone or clone:FindFirstChildWhichIsA("BasePart", true)
-            if not rootPart then
-                -- create dummy part if none found
-                rootPart = Instance.new("Part")
-                rootPart.Size = Vector3.new(0.2,0.2,0.2)
-                rootPart.Transparency = 1
-                rootPart.Parent = clone
-            end
-
-            local modelParent = v:FindFirstChild(ATTACHED_FOLDER_NAME) or Instance.new("Folder")
-            modelParent.Name = ATTACHED_FOLDER_NAME
-            modelParent.Parent = v
-
-            clone.Parent = modelParent
-
-            -- default offset for this tool (if present)
-            local ofs = offsets[child.Name] or {pos = Vector3.new(0,0,0), rot = Vector3.new(0,0,0)}
-            -- compute tool CFrame as hand.CFrame * offset (rot in deg)
-            local rotRad = deg2rad(ofs.rot)
-            local toolCFrame = hand.CFrame * (CFrame.Angles(rotRad.X, rotRad.Y, rotRad.Z) * CFrame.new(ofs.pos))
-            -- place clone so its primary/base part matches
-            pcall(function() 
-                if clone.PrimaryPart == nil then
-                    clone.PrimaryPart = rootPart
-                end
-                clone:SetPrimaryPartCFrame(toolCFrame)
-            end)
-
-            -- create weld constraint between hand and tool root
-            pcall(function()
-                local weld = Instance.new("WeldConstraint")
-                weld.Name = "deer_weld_"..child.Name
-                weld.Part0 = hand
-                weld.Part1 = clone.PrimaryPart
-                weld.Parent = clone.PrimaryPart
-            end)
-
-            -- store info for later adjustments
-            attached[child.Name] = {model = clone, weldPart = clone.PrimaryPart, offset = ofs}
-            print("Attached visual for", child.Name, "->", clone:GetFullName())
-        end
+    -- create clone of the handle part
+    local clone = makeLocalCloneOfPart(handlePart)
+    if not clone then
+        warn("[tool-attach] failed to clone handle")
+        return
     end
-end
 
--- watcher: look for workspace.ToolHandle
-local function tryAttachFromWorkspace()
-    local fh = Workspace:FindFirstChild(TOOL_HANDLE_FOLDER_NAME)
-    if fh and fh.Parent then
-        toolHandleFolder = fh
-        attachToolFolderToVisual(fh)
-        return true
+    -- attach
+    local ok, weld = pcall(function() return attachCloneToVisual(clone, targetPart, targetAttachment) end)
+    if not ok or not weld then
+        pcall(function() clone:Destroy() end)
+        warn("[tool-attach] failed to weld clone")
+        return
     end
-    return false
+
+    equippedMap[tool] = { clone = clone, weld = weld }
 end
 
--- watcher: reconnect on ChildAdded/ChildRemoved in workspace
-local workspaceConn = nil
-local function startWatching()
-    if watching then return end
-    watching = true
-    -- if folder already present
-    tryAttachFromWorkspace()
-    workspaceConn = Workspace.ChildAdded:Connect(function(c)
-        if c.Name == TOOL_HANDLE_FOLDER_NAME then
-            toolHandleFolder = c
-            attachToolFolderToVisual(c)
-        end
+local function onToolUnequipped(tool)
+    local data = equippedMap[tool]
+    if not data then return end
+    if data.weld then pcall(function() data.weld:Destroy() end) end
+    if data.clone and data.clone.Parent then pcall(function() data.clone:Destroy() end) end
+    equippedMap[tool] = nil
+end
+
+-- bind Tool instances (in Backpack or Character)
+local function bindToolInstance(tool)
+    if not tool or toolConns[tool] then return end
+    if not tool:IsA("Tool") then return end
+    -- Equipped/Unequipped events
+    local eConn = tool.Equipped:Connect(function() onToolEquipped(tool) end)
+    local uConn = tool.Unequipped:Connect(function() onToolUnequipped(tool) end)
+    toolConns[tool] = {equip = eConn, unequip = uConn}
+end
+
+local function unbindToolInstance(tool)
+    local t = toolConns[tool]
+    if not t then return end
+    pcall(function() if t.equip then t.equip:Disconnect() end end)
+    pcall(function() if t.unequip then t.unequip:Disconnect() end end)
+    toolConns[tool] = nil
+end
+
+-- watch Backpack and Character
+local function watchContainer(container)
+    if not container then return end
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Tool") then bindToolInstance(child) end
+    end
+    container.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then bindToolInstance(child) end
     end)
 end
 
--- public helpers
-_G.ReloadDeerTools = function()
-    if toolHandleFolder and toolHandleFolder.Parent then
-        attachToolFolderToVisual(toolHandleFolder)
-    else
-        -- try to find in workspace
-        if not tryAttachFromWorkspace() then warn("No ToolHandle in workspace; equip a tool to populate it") end
+-- initial bind
+watchContainer(lp:FindFirstChildOfClass("Backpack"))
+if lp.Character then watchContainer(lp.Character) end
+lp.CharacterAdded:Connect(function(char)
+    watchContainer(char)
+    -- cleanup possible leftover clones for old tools
+    for tool, data in pairs(equippedMap) do
+        if tool and (tool.Parent ~= char) then
+            onToolUnequipped(tool)
+        end
     end
+end)
+
+-- also watch if new tools appear in Backpack at runtime
+local backpack = lp:FindFirstChildOfClass("Backpack")
+if backpack then
+    backpack.ChildAdded:Connect(function(child) if child:IsA("Tool") then bindToolInstance(child) end end)
 end
 
-_G.DetachAllTools = function() clearAttached(); print("Detached all") end
+-- ensure cleanup on unequip / destroy (if tool removed)
+-- also listen for Tools being destroyed -> clean map
+RunService.Heartbeat:Connect(function()
+    for tool, data in pairs(equippedMap) do
+        if not tool or not tool.Parent then
+            onToolUnequipped(tool)
+        end
+    end
+end)
 
--- allow runtime offset tweak (and reapply)
-_G.SetToolOffsetAndReapply = function(name, pos, rotDeg)
-    _G.SetToolOffset(name, pos, rotDeg)
-    _G.ReloadDeerTools()
-end
-
--- start
-startWatching()
-print("[deer-tool-attach] running. Use ReloadDeerTools() to force attach, SetToolOffset(name,pos,rotDeg) to tweak offsets.")
+print("[tool-attach] running. VISUAL:", VISUAL_NAME)
