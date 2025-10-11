@@ -1,43 +1,34 @@
--- toolhandle-attach-robust-fixed.lua  (локальный инжектор)
--- Надёжная версия: авто-очистка старых инстансов, детальный debug.
+-- toolhandle-attach-fixed-debounce.lua  (локальный, инжектор)
+-- Стабильный attach: debounce + проверка "готовности" содержимого ToolHandle
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
 
 local lp = Players.LocalPlayer
-if not lp then warn("[tool-attach] No LocalPlayer, abort") return end
+if not lp then warn("[tool-attach] No LocalPlayer") return end
 
--- stop previous instances if any
-if _G.stopToolAttach then
-    pcall(function() _G.stopToolAttach() end)
-    _G.stopToolAttach = nil
-end
-if _G.stopToolAttachToDeer then
-    pcall(function() _G.stopToolAttachToDeer() end)
-    _G.stopToolAttachToDeer = nil
-end
+-- попыточно остановим старые версии
+if _G.stopToolAttach then pcall(_G.stopToolAttach) end
+_G.stopToolAttach = nil
 
--- SETTINGS (подгони при необходимости)
+-- Настройки
 local VISUAL_NAME = "LOCAL_DEER_VISUAL"
 local HAND_OFFSET_CFRAME = CFrame.new(0, -0.15, -0.5)
 local SEARCH_ATTACHMENT_NAMES = {"RightGripAttachment","RightHandAttachment"}
 local TOOLHANDLE_NAME = "ToolHandle"
 local MAX_OWNER_DISTANCE = 6
+local DEBOUNCE_SEC = 0.14   -- задержка, даём игре подложить все части (подогнать при необходимости)
+local MIN_PART_SIZE = 0.01  -- минимальный размер для части считать "реальной"
 
--- state
+-- Состояние
 local visual = workspace:FindFirstChild(VISUAL_NAME)
-if not visual then
-    warn("[tool-attach] visual not found: " .. VISUAL_NAME .. " — запусти визуал перед этим скриптом")
-else
-    print("[tool-attach] visual found:", visual:GetFullName())
-end
+if not visual then warn("[tool-attach] visual '"..VISUAL_NAME.."' not found; запусти визуал сначала") end
 local activeClone = nil
 local activeSource = nil
-local trackedHandles = {}   -- folder -> {childConn, descConn, remConn}
-local toolConns = {}       -- tool -> {equipConn, unequipConn, ancestryConn}
+local tracked = {}  -- folder -> {scheduled = bool, attached = bool, conns = {}}
 
--- helpers
+-- HELPERS
 local function findTargetInVisual()
     if not visual then return nil, nil end
     for _, name in ipairs(SEARCH_ATTACHMENT_NAMES) do
@@ -53,13 +44,25 @@ local function findTargetInVisual()
     return visual:FindFirstChild("HumanoidRootPart") or visual.PrimaryPart, nil
 end
 
+local function isRenderablePart(part)
+    if not part or not part:IsA("BasePart") then return false end
+    -- size check
+    local s = part.Size
+    if (s.X*s.Y*s.Z) > MIN_PART_SIZE then return true end
+    -- also consider if has mesh id (Common case)
+    local mesh = part:FindFirstChildWhichIsA("SpecialMesh", true)
+    if mesh and (mesh.MeshId and mesh.MeshId ~= "" or mesh.TextureId and mesh.TextureId ~= "") then
+        return true
+    end
+    -- fallback check: transparency < 0.95 (visible)
+    if part.Transparency and part.Transparency < 0.95 then return true end
+    return false
+end
+
 local function cloneEntire(src)
     if not src then return nil end
     local ok, c = pcall(function() return src:Clone() end)
-    if not ok or not c then
-        warn("[tool-attach] clone failed for", src:GetFullName(), c)
-        return nil
-    end
+    if not ok or not c then warn("[tool-attach] clone failed:", tostring(c)); return nil end
     local modelClone
     if c:IsA("Model") then
         modelClone = c
@@ -68,8 +71,11 @@ local function cloneEntire(src)
         c.Parent = modelClone
         modelClone.Name = "LOCAL_TOOL_MODEL"
     end
+    -- sanitize & force visible
+    local partsCount = 0
     for _, v in ipairs(modelClone:GetDescendants()) do
         if v:IsA("BasePart") then
+            partsCount = partsCount + 1
             pcall(function()
                 v.CanCollide = false
                 v.LocalTransparencyModifier = 0
@@ -82,8 +88,8 @@ local function cloneEntire(src)
             pcall(function() v:Destroy() end)
         end
     end
-    modelClone.Parent = visual or workspace
-    return modelClone
+    modelClone.Parent = visual or Workspace
+    return modelClone, partsCount
 end
 
 local function attachClone(modelClone)
@@ -101,9 +107,7 @@ local function attachClone(modelClone)
     if not targetPart then return false end
 
     local baseCFrame = targetPart.CFrame
-    if targetAttachment and targetAttachment:IsA("Attachment") then
-        baseCFrame = targetPart.CFrame * targetAttachment.CFrame
-    end
+    if targetAttachment and targetAttachment:IsA("Attachment") then baseCFrame = targetPart.CFrame * targetAttachment.CFrame end
     local desired = baseCFrame * HAND_OFFSET_CFRAME
 
     pcall(function() modelClone:SetPrimaryPartCFrame(desired) end)
@@ -117,9 +121,7 @@ local function attachClone(modelClone)
 end
 
 local function clearActive()
-    if activeClone and activeClone.Parent then
-        pcall(function() activeClone:Destroy() end)
-    end
+    if activeClone and activeClone.Parent then pcall(function() activeClone:Destroy() end) end
     activeClone = nil
     activeSource = nil
 end
@@ -127,118 +129,135 @@ end
 local function isHandleForLocal(folder)
     if not folder then return false end
     local par = folder.Parent
-    if par == lp.Character or par == lp or (par and par.Name == lp.Name) then
-        return true
-    end
+    if par == lp.Character or par == lp or (par and par.Name == lp.Name) then return true end
     local hrp = lp.Character and (lp.Character:FindFirstChild("HumanoidRootPart") or lp.Character.PrimaryPart)
     if not hrp then return false end
     for _, v in ipairs(folder:GetDescendants()) do
-        if v:IsA("BasePart") and (v.Position - hrp.Position).Magnitude < MAX_OWNER_DISTANCE then
+        if v:IsA("BasePart") and (v.Position - hrp.Position).Magnitude < MAX_OWNER_DISTANCE then return true end
+    end
+    return false
+end
+
+-- Try attach only if folder has at least one renderable descendant
+local function tryAttachFromFolder(folder)
+    if not folder or not folder.Parent then return end
+    if tracked[folder] and tracked[folder].attached then return end
+    if not isHandleForLocal(folder) then return end
+
+    -- find any renderable descendant
+    local found = nil
+    for _, d in ipairs(folder:GetDescendants()) do
+        if d:IsA("BasePart") and isRenderablePart(d) then
+            found = d; break
+        end
+    end
+    if not found then
+        -- nothing renderable yet
+        return false
+    end
+
+    -- ok, clone whole folder now
+    clearActive()
+    local cloned, parts = cloneEntire(folder)
+    if cloned then
+        local ok = attachClone(cloned)
+        if ok then
+            activeClone = cloned
+            activeSource = folder
+            tracked[folder] = tracked[folder] or {}
+            tracked[folder].attached = true
+            print(string.format("[tool-attach] attached clone from ToolHandle: %s  (parts=%d)", tostring(folder:GetFullName()), parts or 0))
+            -- set removal listener
+            tracked[folder].rem = folder.AncestryChanged:Connect(function(_, newParent)
+                if not newParent then
+                    tracked[folder] = nil
+                    clearActive()
+                end
+            end)
             return true
+        else
+            pcall(function() if cloned and cloned.Parent then cloned:Destroy() end end)
         end
     end
     return false
 end
 
-local function handleFolderPopulate(folder)
+-- schedule attach with debounce
+local function scheduleAttach(folder)
     if not folder then return end
-    if not isHandleForLocal(folder) then return end
-    clearActive()
-    if #folder:GetChildren() > 0 then
-        local cloned = cloneEntire(folder)
-        if cloned and attachClone(cloned) then
-            activeClone = cloned
-            activeSource = folder
-            print("[tool-attach] attached clone from ToolHandle:", folder:GetFullName())
-            if not trackedHandles[folder] then
-                trackedHandles[folder] = {}
-                trackedHandles[folder].rem = folder.AncestryChanged:Connect(function(_, newParent)
-                    if not newParent then clearActive() end
-                end)
-            end
-            return
-        else
-            pcall(function() if cloned and cloned.Parent then cloned:Destroy() end end)
+    tracked[folder] = tracked[folder] or {}
+    if tracked[folder].scheduled then return end
+    tracked[folder].scheduled = true
+    task.delay(DEBOUNCE_SEC, function()
+        if not folder or not folder.Parent then tracked[folder] = nil; return end
+        tracked[folder].scheduled = false
+        -- try attach; if failed, try once more after small delay (gives game time to populate more)
+        local attached = tryAttachFromFolder(folder)
+        if not attached then
+            -- second try short delay
+            task.delay(0.12, function()
+                if folder and folder.Parent then tryAttachFromFolder(folder) end
+            end)
         end
-    end
-    if not trackedHandles[folder] then
-        trackedHandles[folder] = {}
-        trackedHandles[folder].childConn = folder.ChildAdded:Connect(function(child)
-            if child and child:IsA("BasePart") then
-                task.defer(function()
-                    if folder and folder.Parent then
-                        local cloned = cloneEntire(folder)
-                        if cloned and attachClone(cloned) then
-                            activeClone = cloned
-                            activeSource = folder
-                            print("[tool-attach] attached clone (after child) from ToolHandle:", folder:GetFullName())
-                            trackedHandles[folder].rem = folder.AncestryChanged:Connect(function(_, newParent)
-                                if not newParent then clearActive() end
-                            end)
-                        else
-                            pcall(function() if cloned and cloned.Parent then cloned:Destroy() end end)
-                        end
-                    end
-                end)
-            end
-        end)
-        trackedHandles[folder].descConn = folder.DescendantAdded:Connect(function(desc)
-            if desc and desc:IsA("BasePart") then
-                task.defer(function()
-                    if folder and folder.Parent then
-                        local cloned = cloneEntire(folder)
-                        if cloned and attachClone(cloned) then
-                            activeClone = cloned
-                            activeSource = folder
-                            print("[tool-attach] attached clone (after desc) from ToolHandle:", folder:GetFullName())
-                            trackedHandles[folder].rem = folder.AncestryChanged:Connect(function(_, newParent)
-                                if not newParent then clearActive() end
-                            end)
-                        else
-                            pcall(function() if cloned and cloned.Parent then cloned:Destroy() end end)
-                        end
-                    end
-                end)
-            end
-        end)
-    end
+    end)
 end
 
-local globalHandleConn = Workspace.DescendantAdded:Connect(function(inst)
+-- handler when ToolHandle appears
+local function onToolHandleFound(folder)
+    if not folder then return end
+    if not isHandleForLocal(folder) then return end
+
+    -- if already attached to this folder, ignore
+    if activeSource == folder then return end
+
+    -- if folder already has renderable parts, attach immediately
+    if tryAttachFromFolder(folder) then return end
+
+    -- otherwise subscribe to DescendantAdded and schedule attach on changes
+    if not tracked[folder] then tracked[folder] = {} end
+    if tracked[folder].descConn then return end
+    tracked[folder].descConn = folder.DescendantAdded:Connect(function(desc)
+        if desc and desc:IsA("BasePart") then scheduleAttach(folder) end
+    end)
+    tracked[folder].childConn = folder.ChildAdded:Connect(function(child) if child and child:IsA("BasePart") then scheduleAttach(folder) end end)
+    -- also schedule an initial attempt (in case parts already present but were not counted)
+    scheduleAttach(folder)
+end
+
+-- GLOBAL WATCHERS
+local g1 = Workspace.DescendantAdded:Connect(function(inst)
     if inst and inst.Name == TOOLHANDLE_NAME and (inst:IsA("Folder") or inst:IsA("Model")) then
-        task.defer(function() handleFolderPopulate(inst) end)
+        task.defer(function() onToolHandleFound(inst) end)
     end
 end)
-local globalGConn = game.DescendantAdded:Connect(function(inst)
+local g2 = game.DescendantAdded:Connect(function(inst)
     if inst and inst.Name == TOOLHANDLE_NAME and (inst:IsA("Folder") or inst:IsA("Model")) then
-        task.defer(function() handleFolderPopulate(inst) end)
+        task.defer(function() onToolHandleFound(inst) end)
     end
 end)
 
+-- fallback: Tools in Backpack/Character (standard Tools)
+local toolConns = {}
 local function bindTool(tool)
     if not tool or toolConns[tool] then return end
     toolConns[tool] = {}
     toolConns[tool].equip = tool.Equipped:Connect(function()
         clearActive()
-        local cl = cloneEntire(tool)
+        local cl, parts = cloneEntire(tool)
         if cl and attachClone(cl) then
-            activeClone = cl
-            activeSource = tool
-            print("[tool-attach] attached clone from Tool:", tool:GetFullName())
-            toolConns[tool].ancestry = tool.AncestryChanged:Connect(function(_, newP) if not newP then clearActive() end end)
+            activeClone = cl; activeSource = tool
+            print("[tool-attach] attached clone from Tool: "..tostring(tool:GetFullName()).." parts="..tostring(parts))
+            toolConns[tool].ancestry = tool.AncestryChanged:Connect(function(_, new) if not new then clearActive() end end)
         else
             pcall(function() if cl and cl.Parent then cl:Destroy() end end)
         end
     end)
     toolConns[tool].unequip = tool.Unequipped:Connect(function() clearActive() end)
-    toolConns[tool].ancestry = tool.AncestryChanged:Connect(function(_, newP) if not newP then clearActive() end end)
 end
 
 local function watchContainer(container)
     if not container then return end
-    for _, child in ipairs(container:GetChildren()) do
-        if child:IsA("Tool") then bindTool(child) end
-    end
+    for _, child in ipairs(container:GetChildren()) do if child:IsA("Tool") then bindTool(child) end end
     container.ChildAdded:Connect(function(child) if child and child:IsA("Tool") then bindTool(child) end end)
 end
 
@@ -248,14 +267,16 @@ lp.CharacterAdded:Connect(function(char) watchContainer(char) end)
 
 -- cleanup
 local function stopAll()
-    if globalHandleConn then globalHandleConn:Disconnect(); globalHandleConn = nil end
-    if globalGConn then globalGConn:Disconnect(); globalGConn = nil end
+    if g1 then g1:Disconnect(); g1 = nil end
+    if g2 then g2:Disconnect(); g2 = nil end
     clearActive()
-    for folder, conns in pairs(trackedHandles) do
-        for k, c in pairs(conns) do pcall(function() c:Disconnect() end) end
+    for f, t in pairs(tracked) do
+        if t.descConn then pcall(function() t.descConn:Disconnect() end) end
+        if t.childConn then pcall(function() t.childConn:Disconnect() end) end
+        if t.rem then pcall(function() t.rem:Disconnect() end) end
     end
-    trackedHandles = {}
-    for t, tbl in pairs(toolConns) do
+    tracked = {}
+    for tool, tbl in pairs(toolConns) do
         for _, c in pairs(tbl) do pcall(function() c:Disconnect() end) end
     end
     toolConns = {}
@@ -263,4 +284,4 @@ local function stopAll()
 end
 
 _G.stopToolAttach = stopAll
-print("[tool-attach] running — watching ToolHandle and Tools. VISUAL:", VISUAL_NAME)
+print("[tool-attach] running; visual:", tostring(visual and visual:GetFullName() or "nil"))
