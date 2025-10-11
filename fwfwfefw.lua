@@ -1,331 +1,258 @@
--- attach-visual-tools.lua  (client / injector)
--- Клонирует визуальный предмет и вешает его в руке визуала (Deer).
--- Настраиваемые параметры вверху.
+-- visual-deer-morph-fixed11.lua  (client / injector)
+-- Added: Visual tool clone/attach to Deer hand on equip, manual offset tune.
 
-local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
-local workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 local lp = Players.LocalPlayer
 if not lp then warn("No LocalPlayer") return end
 
--- ============ Настройки ============
-local VISUAL_NAMES = {"LOCAL_DEER_VISUAL", "Deer_LOCAL", "LOCAL_DEER"} -- модели, где искать визуал
-local ATTACH_CANDIDATES = {
-    "RightGripAttachment", "RightGrip", "RightGripAttachment0", "RightHand", "RightArm",
-    "FrontRightLeg", "Front_Right_Leg", "RightFrontLeg", "Right_Front_Leg"
-}
-local TOOL_HANDLE_FOLDER_NAME = "ToolHandle" -- если тулхендлы складывает туда игра
-local MANUAL_ATTACH_CFRAME = CFrame.new(0,0,0) -- если нужно подвинуть позицию/ориентацию вручную (в local space of attach)
-local TOOL_CLONE_PREFIX = "VIS_TOOL_"
-local DEBUG = false
--- ====================================
+-- Подставь свои настройки / ID
+local TEMPLATE_NAME = "Deer"
+local IDLE_ID = "rbxassetid://138304500572165"
+local WALK_ID = "rbxassetid://78826693826761"
+local VISUAL_NAME = "LOCAL_DEER_VISUAL"
+local FP_HIDE_DISTANCE = 0.6
+local HIP_MANUAL_OFFSET = nil
+local TOOL_OFFSET = CFrame.new(0, 0, 0) * CFrame.Angles(0, 0, 0)  -- manual tune pos/rot with F3X (e.g. Vector3(0.5, 0, -1), math.rad(90,0,0))
 
-local attachedClone = nil   -- текущный clone model
-local attachedTool = nil    -- реальный Tool (если есть)
-local attachPart = nil      -- Part on visual where tool attaches
-local attachOffset = nil    -- CFrame offset: attachCFrame * offset = toolPrimary.CFrame
-local visualModel = nil
+local template = workspace:FindFirstChild(TEMPLATE_NAME)
+if not template then warn("Deer template not found") return end
 
-local function dbg(...)
-    if DEBUG then print("[attach-tools]", ...) end
-end
+local visual, animator, animController, idleTrack, walkTrack
+local followConn, runConn
+local connections = {}
+local toolConns = {}
+local childAddedConns = {}
+local cam = workspace.CurrentCamera
+local currentToolVisual = nil  -- current visual tool
 
--- ищем визуальную модель (по имени или по наличию LocalVisualAnimController)
-local function findVisual()
-    -- 1) быстрый поиск по именам
-    for _, n in ipairs(VISUAL_NAMES) do
-        local m = workspace:FindFirstChild(n)
-        if m and m:IsA("Model") then
-            dbg("found visual by name", n)
-            return m
+local function addConn(c) if c then table.insert(connections, c) end end
+local function disconnectAll() for _,c in ipairs(connections) do pcall(function() c:Disconnect() end) end connections = {} end
+
+local function setLocalVisibility(model, visible, isVisual)
+    if not model then return end
+    for _, v in ipairs(model:GetDescendants()) do
+        if v:IsA("BasePart") then
+            pcall(function()
+                v.LocalTransparencyModifier = visible and 0 or 1
+                -- только для визуала меняем коллайд/массу
+                if isVisual then
+                    v.CanCollide = false
+                    if v.Massless ~= nil then v.Massless = true end
+                end
+            end)
         end
     end
-    -- 2) поиск по наличию AnimationController с именем LocalVisualAnimController
-    for _, obj in ipairs(workspace:GetChildren()) do
-        if obj:IsA("Model") then
-            if obj:FindFirstChild("LocalVisualAnimController") or obj:FindFirstChildWhichIsA("AnimationController") then
-                dbg("found visual by animcontroller:", obj.Name)
-                return obj
-            end
-            -- fallback: find Animator / Animator descendant
-            if obj:FindFirstChildWhichIsA("Animator", true) then
-                dbg("found visual by Animator descendant:", obj.Name)
-                return obj
-            end
-        end
-    end
-    return nil
 end
 
--- найти подходящую part/attachment в visual
-local function findAttachPart(model)
+local function isFirstPerson()
+    local char = lp.Character
+    local head = char and char:FindFirstChild("Head")
+    if not head or not cam then return false end
+    return (cam.CFrame.Position - head.Position).Magnitude < FP_HIDE_DISTANCE
+end
+
+local function lowestY(model)
     if not model then return nil end
-    -- first: attachments by name
-    for _, name in ipairs(ATTACH_CANDIDATES) do
-        local it = model:FindFirstChild(name, true)
-        if it and it:IsA("Attachment") then
-            return it.Parent -- attachment attachment.Parent should be a BasePart
-        elseif it and it:IsA("BasePart") then
-            return it
-        end
-    end
-    -- second: try to find RightHand / FrontRightLeg parts explicitly
+    local minY = math.huge; local found = false
     for _, p in ipairs(model:GetDescendants()) do
         if p:IsA("BasePart") then
-            local ln = string.lower(p.Name)
-            if ln:find("right") and (ln:find("hand") or ln:find("arm") or ln:find("front") or ln:find("leg")) then
-                return p
-            end
+            found = true
+            local bottom = p.Position.Y - (p.Size.Y/2)
+            if bottom < minY then minY = bottom end
         end
     end
-    -- fallback: PrimaryPart or Head
-    if model.PrimaryPart then return model.PrimaryPart end
-    local head = model:FindFirstChild("Head", true)
-    if head then return head end
-    -- last resort: any BasePart
-    for _, p in ipairs(model:GetDescendants()) do
-        if p:IsA("BasePart") then return p end
-    end
-    return nil
+    return found and minY or nil
 end
 
--- выбрать источник (где взять визуальную модель предмета)
-local function findToolSource(tool)
-    -- if workspace has ToolHandle folder with children, prefer that (game-specific)
-    local fh = workspace:FindFirstChild(TOOL_HANDLE_FOLDER_NAME)
-    if fh and #fh:GetChildren() > 0 then
-        dbg("Using workspace.ToolHandle as tool source")
-        return fh
-    end
-    -- otherwise use the Tool instance itself (it may contain parts)
-    if tool and tool.Parent then
-        return tool
-    end
-    return nil
+local function loadTrack(animObj, id, looped)
+    if not animObj or not id then return nil end
+    local anim = Instance.new("Animation")
+    anim.AnimationId = id
+    anim.Parent = animObj
+    local ok, track = pcall(function() return animObj:LoadAnimation(anim) end)
+    if not ok or not track then pcall(function() anim:Destroy() end) warn("anim load failed", id, track) return nil end
+    track.Looped = looped and true or false
+    track.Priority = Enum.AnimationPriority.Movement
+    return track
 end
 
--- sanitize cloned tool model (remove scripts)
-local function sanitizeToolClone(mdl)
-    for _, d in ipairs(mdl:GetDescendants()) do
-        if d:IsA("Script") or d:IsA("ModuleScript") or d:IsA("LocalScript") then
-            pcall(function() d:Destroy() end)
-        end
-        if d:IsA("BasePart") then
-            pcall(function()
-                d.CanCollide = false
-                d.LocalTransparencyModifier = 0
-                if d.Massless ~= nil then d.Massless = true end
+local function createVisualTool(tool)
+    if not visual then return end
+    -- clone ToolHandle if exist, else tool itself
+    local handle = workspace:FindFirstChild("ToolHandle") or tool:FindFirstChild("Handle") or tool  -- game custom ToolHandle
+    if not handle then return end
+    local vHandle = handle:Clone()
+    vHandle.Name = "VISUAL_TOOL_" .. (tool.Name or "Tool")
+    vHandle.Parent = visual
+    setLocalVisibility(vHandle, true, true)  -- apply visual props
+
+    local deerHand = safeFindPart(visual, {"RightHand", "RightUpperArm", "RightArm"})
+    if not deerHand then deerHand = visual.PrimaryPart end
+    local gripAtt = vHandle:FindFirstChild("RightGripAttachment") or Instance.new("Attachment", vHandle)  -- use existing or new
+
+    local handAtt = Instance.new("Attachment", deerHand)
+    local ap = Instance.new("AlignPosition", vHandle); ap.Attachment0 = gripAtt; ap.Attachment1 = handAtt; ap.RigidityEnabled = true; ap.MaxForce = math.huge; ap.Responsiveness = 200
+    local ao = Instance.new("AlignOrientation", vHandle); ao.Attachment0 = gripAtt; ao.Attachment1 = handAtt; ao.RigidityEnabled = true; ao.MaxTorque = math.huge; ao.Responsiveness = 200
+
+    -- manual offset apply
+    gripAtt.CFrame = TOOL_OFFSET
+
+    return vHandle
+end
+
+local function bindTools(container)
+    if not container then return end
+    for _, t in ipairs(container:GetChildren()) do
+        if t:IsA("Tool") and not toolConns[t] then
+            toolConns[t] = {}
+            toolConns[t].equip = t.Equipped:Connect(function()
+                setLocalVisibility(t, false, false)
+                if currentToolVisual then currentToolVisual:Destroy() end
+                currentToolVisual = createVisualTool(t)
             end)
+            toolConns[t].unequip = t.Unequipped:Connect(function()
+                setLocalVisibility(t, true, false)
+                if currentToolVisual then currentToolVisual:Destroy() currentToolVisual = nil end
+            end)
+            addConn(toolConns[t].equip); addConn(toolConns[t].unequip)
         end
     end
-end
-
--- helper: find primary part in a model (first BasePart or named Handle/OriginalItem)
-local function choosePrimary(mdl)
-    if not mdl then return nil end
-    local candidates = {"Handle", "OriginalItem", "Part", "Main", "Mesh", "Head"}
-    for _, name in ipairs(candidates) do
-        local p = mdl:FindFirstChild(name, true)
-        if p and p:IsA("BasePart") then return p end
-    end
-    -- otherwise first BasePart
-    for _, c in ipairs(mdl:GetDescendants()) do
-        if c:IsA("BasePart") then return c end
-    end
-    return nil
-end
-
--- attach visual clone to visualModel at attachPart with computed offset
-local function attachCloneToVisual(cloneModel, attachP, manualCFrame)
-    if not cloneModel or not attachP then return end
-    sanitizeToolClone(cloneModel)
-    -- choose primary for the clone
-    local primary = choosePrimary(cloneModel)
-    if not primary then
-        warn("No BasePart in tool clone to use as Primary")
-        cloneModel:Destroy()
-        return
-    end
-    cloneModel.Parent = visualModel
-    cloneModel.Name = TOOL_CLONE_PREFIX .. (cloneModel.Name or "tool")
-    cloneModel.PrimaryPart = primary
-
-    -- compute offset: offset such that attach.CFrame * offset = toolPrimary.CFrame
-    local offset = attachP.CFrame:Inverse() * primary.CFrame
-    if manualCFrame then
-        offset = offset * manualCFrame
-    end
-
-    attachedClone = cloneModel
-    attachPart = attachP
-    attachOffset = offset
-    dbg("attached tool clone:", cloneModel.Name, "offset:", tostring(offset))
-end
-
--- clean current attached clone
-local function clearAttached()
-    if attachedClone and attachedClone.Parent then
-        pcall(function() attachedClone:Destroy() end)
-    end
-    attachedClone = nil
-    attachedTool = nil
-    attachPart = nil
-    attachOffset = nil
-end
-
--- create clone from source and attach
-local function createAndAttachFromSource(source, toolObj)
-    if not source then return end
-    -- If source is a folder like ToolHandle with multiple children, wrap them into a Model
-    local newModel
-    if source:IsA("Folder") or source:IsA("Model") and source ~= toolObj then
-        -- clone entire folder/model
-        local ok, cl = pcall(function() return source:Clone() end)
-        if not ok or not cl then warn("failed clone source", cl); return end
-        -- if cloned is a Folder, wrap children into a Model
-        if cl:IsA("Folder") then
-            local mdl = Instance.new("Model")
-            mdl.Name = "temp_tool_clone"
-            for _, c in ipairs(cl:GetChildren()) do
-                c.Parent = mdl
+    if not childAddedConns[container] then
+        childAddedConns[container] = container.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") and not toolConns[child] then
+                toolConns[child] = {}
+                toolConns[child].equip = child.Equipped:Connect(function()
+                    setLocalVisibility(child, false, false)
+                    if currentToolVisual then currentToolVisual:Destroy() end
+                    currentToolVisual = createVisualTool(child)
+                end)
+                toolConns[child].unequip = child.Unequipped:Connect(function()
+                    setLocalVisibility(child, true, false)
+                    if currentToolVisual then currentToolVisual:Destroy() currentToolVisual = nil end
+                end)
+                addConn(toolConns[child].equip); addConn(toolConns[child].unequip)
             end
-            cl:Destroy()
-            newModel = mdl
+        end)
+        addConn(childAddedConns[container])
+    end
+end
+
+local function cleanupTools()
+    for tool, tbl in pairs(toolConns) do
+        if tbl.equip then pcall(function() tbl.equip:Disconnect() end) end
+        if tbl.unequip then pcall(function() tbl.unequip:Disconnect() end) end
+        toolConns[tool] = nil
+    end
+    for c, conn in pairs(childAddedConns) do pcall(function() conn:Disconnect() end) childAddedConns[c] = nil end
+    if currentToolVisual then currentToolVisual:Destroy() currentToolVisual = nil end
+end
+
+local function createVisual()
+    if visual then return end
+    local ok, clone = pcall(function() return template:Clone() end)
+    if not ok or not clone then warn("clone failed", clone) return end
+    clone.Name = VISUAL_NAME
+
+    -- sanitize clone
+    for _, d in ipairs(clone:GetDescendants()) do
+        if d:IsA("Script") or d:IsA("ModuleScript") or d:IsA("Humanoid") then pcall(function() d:Destroy() end) end
+        if d:IsA("BasePart") then pcall(function() d.CanCollide = false; d.Anchored = false; if d.Massless ~= nil then d.Massless = true end end) end
+    end
+
+    local prim = clone:FindFirstChild("HumanoidRootPart") or clone:FindFirstChildWhichIsA("BasePart", true)
+    if prim then clone.PrimaryPart = prim end
+    clone.Parent = workspace
+    visual = clone
+
+    -- align feet
+    local char = lp.Character or lp.CharacterAdded:Wait()
+    local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+    local playerFeet = lowestY(char)
+    local visualFeet = lowestY(visual)
+    if playerFeet and visualFeet then
+        local dy = playerFeet - visualFeet
+        pcall(function() if visual.PrimaryPart then visual:SetPrimaryPartCFrame(visual.PrimaryPart.CFrame * CFrame.new(0, dy, 0)) end end)
+        print("[visual] aligned feet dy=", dy)
+    else
+        print("[visual] feet align failed")
+    end
+
+    -- AnimationController (no Humanoid)
+    animController = Instance.new("AnimationController"); animController.Parent = visual
+    animator = Instance.new("Animator"); animator.Parent = animController
+    idleTrack = loadTrack(animator, IDLE_ID, true)
+    walkTrack = loadTrack(animator, WALK_ID, true)
+    if idleTrack then pcall(function() idleTrack:Play() end) end
+
+    -- hide real char visually (do NOT change its CanCollide)
+    setLocalVisibility(char, false, false)
+
+    -- compute HIP_OFFSET
+    local HIP_OFFSET = HIP_MANUAL_OFFSET
+    if not HIP_OFFSET then
+        if visual.PrimaryPart and hrp then HIP_OFFSET = visual.PrimaryPart.Position.Y - hrp.Position.Y else HIP_OFFSET = 5.0 end
+    end
+    print("[visual] HIP_OFFSET =", HIP_OFFSET)
+
+    -- bind tools
+    pcall(function() bindTools(lp:FindFirstChildOfClass("Backpack")) end)
+    pcall(function() bindTools(char) end)
+    addConn(lp.CharacterAdded:Connect(function(nc) pcall(function() bindTools(nc) end); pcall(function() setLocalVisibility(nc, false, false) end) end))
+
+    -- follow loop: snap PrimaryPart to target each frame, and zero velocities for all visual parts
+    followConn = RunService.RenderStepped:Connect(function()
+        if not visual or not visual.PrimaryPart or not hrp then return end
+        local fp = isFirstPerson()
+        if fp then
+            setLocalVisibility(visual, false, true)
+            setLocalVisibility(char, false, false)
         else
-            newModel = cl
+            setLocalVisibility(visual, true, true)
+            setLocalVisibility(char, false, false)
         end
-    else
-        -- clone tool object (Tool or part)
-        local ok, cl = pcall(function() return source:Clone() end)
-        if not ok or not cl then warn("failed clone tool", cl); return end
-        newModel = cl
-    end
 
-    -- attach to visual at best attach part
-    local ap = findAttachPart(visualModel)
-    if not ap then
-        warn("No attach part found in visualModel")
-        newModel:Destroy()
-        return
-    end
-    attachCloneToVisual(newModel, ap, MANUAL_ATTACH_CFRAME)
-end
-
--- monitor tool equip/unequip from player's character and backpack
-local function monitorTools()
-    -- when a Tool is equipped in character, or when ToolHandle appears/changes, we update visual
-    local function onEquip(tool)
-        pcall(clearAttached)
-        attachedTool = tool
-        -- try to find source: workspace.ToolHandle first, else the tool itself
-        local source = findToolSource(tool) or tool
-        createAndAttachFromSource(source, tool)
-    end
-    local function onUnequip(tool)
-        pcall(clearAttached)
-    end
-
-    -- bind existing tools
-    local function bindContainer(container)
-        if not container then return end
-        -- ChildAdded may be used for new tools
-        container.ChildAdded:Connect(function(child)
-            if child:IsA("Tool") then
-                child.Equipped:Connect(function() onEquip(child) end)
-                child.Unequipped:Connect(function() onUnequip(child) end)
-            end
-        end)
-        -- existing tools
-        for _, t in ipairs(container:GetChildren()) do
-            if t:IsA("Tool") then
-                t.Equipped:Connect(function() onEquip(t) end)
-                t.Unequipped:Connect(function() onUnequip(t) end)
-            end
-        end
-    end
-
-    bindContainer(lp:FindFirstChildOfClass("Backpack"))
-    if lp.Character then bindContainer(lp.Character) end
-    lp.CharacterAdded:Connect(function(char)
-        bindContainer(char)
-    end)
-
-    -- also monitor workspace.ToolHandle changes (some games put tool visuals there)
-    local th = workspace:FindFirstChild(TOOL_HANDLE_FOLDER_NAME)
-    if th then
-        th.ChildAdded:Connect(function()
-            -- if there's currently an attachedTool, attempt to reattach from ToolHandle
-            if attachedTool then
-                -- small delay to allow game to populate the folder
-                task.delay(0.05, function()
-                    if attachedTool then
-                        createAndAttachFromSource(th, attachedTool)
-                    end
+        local target = hrp.CFrame * CFrame.new(0, HIP_OFFSET, 0)
+        -- snap root
+        pcall(function() visual:SetPrimaryPartCFrame(target) end)
+        -- zero velocities to avoid physics drift (do for parts only)
+        for _, part in ipairs(visual:GetDescendants()) do
+            if part:IsA("BasePart") then
+                pcall(function()
+                    part.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                    part.AssemblyAngularVelocity = Vector3.new(0,0,0)
                 end)
             end
-        end)
-    else
-        -- if folder appears later
-        workspace.ChildAdded:Connect(function(c)
-            if c and c.Name == TOOL_HANDLE_FOLDER_NAME then
-                -- bind new
-                c.ChildAdded:Connect(function()
-                    if attachedTool then
-                        task.delay(0.05, function() createAndAttachFromSource(c, attachedTool) end)
-                    end
-                end)
-            end
-        end)
-    end
-end
-
--- per-frame updater: move attachedClone PrimaryPart to attachPart using stored offset
-local function startFollowLoop()
-    RunService:BindToRenderStep("VisualToolFollow_"..lp.UserId, Enum.RenderPriority.Camera.Value + 1, function()
-        if attachedClone and attachedClone.PrimaryPart and attachPart and attachOffset then
-            local ok, err = pcall(function()
-                attachedClone.PrimaryPart.CFrame = attachPart.CFrame * attachOffset
-            end)
-            if not ok then dbg("follow error", err) end
         end
     end)
-end
+    addConn(followConn)
 
--- find visual model and start
-visualModel = findVisual()
-if not visualModel then
-    warn("Visual model not found in workspace. Attach-visual-tools will try to auto-find later.")
-    -- try to watch workspace for visual appearing
-    workspace.ChildAdded:Connect(function(child)
-        if not visualModel and child:IsA("Model") then
-            if child:FindFirstChild("LocalVisualAnimController") or child.Name == VISUAL_NAMES[1] then
-                visualModel = child
-                dbg("visual found on ChildAdded:", child.Name)
+    -- sync run -> anims
+    local realHum = char:FindFirstChildOfClass("Humanoid")
+    if realHum and walkTrack then
+        runConn = realHum.Running:Connect(function(speed)
+            if speed > 0.5 then
+                if idleTrack then pcall(function() idleTrack:Stop(0.12) end) end
+                if walkTrack and not walkTrack.IsPlaying then pcall(function() walkTrack:Play() end) end
+            else
+                if walkTrack and walkTrack.IsPlaying then pcall(function() walkTrack:Stop(0.12) end) end
+                if idleTrack and not idleTrack.IsPlaying then pcall(function() idleTrack:Play() end) end
             end
-        end
-    end)
-else
-    dbg("visualModel:", visualModel:GetFullName())
-end
-
-monitorTools()
-startFollowLoop()
-
--- Expose some functions for manual control/tuning
-_G.AttachTools_Clear = clearAttached
-_G.AttachTools_FindAttachPart = function()
-    if visualModel then return findAttachPart(visualModel) end
-    return nil
-end
-_G.AttachTools_SetManualCFrame = function(cf)
-    if type(cf) == "userdata" and cf.ClassName == "CFrame" then
-        MANUAL_ATTACH_CFRAME = cf
-        if attachedClone and attachPart then
-            -- recompute offset quickly
-            local prim = attachedClone.PrimaryPart
-            if prim then attachOffset = attachPart.CFrame:Inverse() * prim.CFrame * MANUAL_ATTACH_CFRAME end
-        end
+        end)
+        addConn(runConn)
     end
+
+    print("[visual] created")
 end
 
-print("[attach-visual-tools] running. Take a tool to see it in Deer hand. Use AttachTools_Clear() to clear.")
+local function revertVisual()
+    disconnectAll()
+    cleanupTools()
+    if visual and visual.Parent then pcall(function() visual:Destroy() end) end
+    visual, animator, animController, idleTrack, walkTrack = nil, nil, nil, nil, nil
+    local char = lp.Character
+    if char then pcall(function() setLocalVisibility(char, true, false) end) end
+    print("[visual] reverted")
+end
+
+-- run
