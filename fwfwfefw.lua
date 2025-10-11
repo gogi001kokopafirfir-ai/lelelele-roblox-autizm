@@ -1,6 +1,6 @@
 -- visual-deer-morph-fixed11.lua  (patch with tool visual in hand)
 -- Added: Clone ToolHandle on equip, attach to Deer hand (align rigid, no anim).
--- Fixed: Typo in toolConns keys (child.."_un" -> child].unequip).
+-- Fixed: Typo in toolConns keys (child.."_un" -> child.unequip).
 -- Tune: Add names to handNames if rig differ; manual gripOffset if not fit (CFrame.new(0,0,0) * CFrame.Angles(...)).
 
 local Players = game:GetService("Players")
@@ -86,7 +86,7 @@ local function createToolVisual(toolHandle)
     setLocalVisibility(vHandle, true, true)  -- apply visual rules (no collide/mass)
 
     -- find hand in visual
-    local handNames = {"RightHand", "Right Arm", "RightUpperArm", "Hand", "Arm"}  -- add more if rig differ
+    local handNames = {"RightHand", "Right Arm", "RightUpperArm", "Hand", "Arm", "DeerHand", "RightPaw"}  -- add more if rig differ
     local hand = safeFindPart(visual, handNames)
     if not hand then
         warn("No hand found in visual, fallback to PrimaryPart")
@@ -137,6 +137,8 @@ local function bindTools(container)
                 local toolHandle = lp.Character:FindFirstChild("ToolHandle")
                 if toolHandle then
                     toolVisuals[t] = createToolVisual(toolHandle)
+                else
+                    warn("No ToolHandle found on equip")
                 end
             end)
             toolConns[t].unequip = t.Unequipped:Connect(function()
@@ -155,6 +157,8 @@ local function bindTools(container)
                     local toolHandle = lp.Character:FindFirstChild("ToolHandle")
                     if toolHandle then
                         toolVisuals[child] = createToolVisual(toolHandle)
+                    else
+                        warn("No ToolHandle found on equip")
                     end
                 end)
                 toolConns[child].unequip = child.Unequipped:Connect(function()
